@@ -50,27 +50,56 @@ Applying [`scripts/patches/patch_vllm_torchtpu_kimi_k31.py`](scripts/patches/pat
 4. **Filters DSA Indexer Tensors (`120` Tensors)**: Maps `".self_attn.indexer.": None` in `KimiLinearForCausalLM.hf_to_vllm_mapper` and skips `.self_attn.indexer.` in `_ordinary_weights()` so TPU `KimiMLAAttention` executes exact dense Gated MLA (`indexer=None, is_sparse=False`) without unexpected-weight assertion errors.
 5. **Guards `TPU_K3_SP_PREFILL` for `TP=8, DP=4, EP=32`**: Automatically sets `TPU_K3_SP_PREFILL=0` when `TP != 32` or `DP != 1` to prevent `ValueError("K3 SP prefill requires TP32/EP32 and PP1/DP1")`.
 
+### 2.3 Critical Hybrid KDA + MLA Scheduler Discovery (`--max-num-batched-tokens=2720`)
+
+In `vllm-torchtpu`, `Kimi-K3.1-Pro` aligns its hybrid Mamba/KDA recurrent state slot (`870,400` bytes) with the FP8 MLA KV cache block slot (`640` bytes/token), deriving a unified `block_size = 1,360` tokens.
+- Under `--mamba-cache-mode=align`, the vLLM v1 scheduler requires any partial prefill chunk of a multi-block prompt (`> 1,360` tokens, such as `8k`, `64k`, `128k`) to be a multiple of `mamba_block_size = 1,360` tokens (`>= 1,360` tokens).
+- If `--max-num-batched-tokens=1360`, having even **1 active decode request (`1` token)** reduces the step's remaining token budget to `1360 - 1 = 1359 < 1360`, which rounds down to `(1359 // 1360) * 1360 = 0` tokens. This causes severe head-of-line blocking where each DP engine can only run `1` request at a time for prompts `>= 1,360` tokens (`54.39` output tok/s plateau at `8k/1k`).
+- **Fix**: Setting **`--max-num-batched-tokens=2720`** (`2 × 1,360`) with `--compilation-config='{"compile_sizes":[1,8,16,32,64,1360,2720]}'` guarantees `token_budget = 2720 - num_running_decode_reqs >= 2720 - 64 = 2656 >= 1360`, allowing every DP engine to schedule a full `1,360`-token prefill chunk alongside up to `64` active decode sequences and lifting `8k/1k` throughput from `54.39` to **`328.22` output tok/s (`2,979.53` total tok/s)**.
+
+### 2.4 SGLang-Inspired Hardware & Pallas Kernel Optimizations Ported to `vllm-torchtpu`
+
+By cross-auditing the `SGLang-TorchTPU` Day-0 cookbook (`origin/kimi-k31-pro-tpu`) against `vllm-torchtpu` (`src/vllm_torchtpu/`), we identified 5 hardware and Pallas kernel optimizations that can be directly enabled in `vllm-torchtpu` (configured in [`configs/kimi-k3.1-pro-tp32-ep32.sh`](configs/kimi-k3.1-pro-tp32-ep32.sh) and [`configs/kimi-k3.1-pro-tp8-dp4-ep32.sh`](configs/kimi-k3.1-pro-tp8-dp4-ep32.sh)):
+
+| Optimization | `vllm-torchtpu` Flag / Setting | Hardware Mechanism on TPU v7x (Ironwood) |
+| :--- | :--- | :--- |
+| **A. Ironwood SparseCore Gather Offload** | `LIBTPU_INIT_ARGS="--xla_tpu_offload_gather_to_sparsecore=true --xla_tpu_buffer_assignment_enable_fast_merge_fallback=false --xla_tpu_scoped_vmem_limit_kib=65536"` | Offloads embedding and MoE routing gather operations from the main TensorCore MXU/VPU onto Ironwood's dedicated SparseCore engines |
+| **B. `TP=32` Sequence-Parallel Prefill + Tuned v2 MLA Pallas Table** | `--tensor-parallel-size=32 --data-parallel-size=1 --block-size=256` + `TPU_K3_SP_PREFILL=1` | Activates `FusedPrefillCollectives` sequence parallelism across all 32 TensorCores and hits the tuned v2 MLA Pallas kernel table (`actual_num_q_heads = 96/32 = 3`, `kv_dtype = fp8`, `page_size_per_kv_packing = 64`) |
+| **C. Fused Pallas MoE Decode Kernel & One-Shot Greedy Top-Tokens** | `FUSED_MOE_DECODE_KERNEL=1`, `FUSED_MOE_DECODE_KERNEL_MAX_TOKENS=256`, `TPU_MOE_SKIP_PADDED_TOKENS=1`, `TPU_GREEDY_TOP_TOKENS=1` | Uses dedicated small-batch Pallas MoE decode kernel (`<= 256` tokens), skips padded routing tokens, and gathers only top-1 greedy token IDs instead of full `163,840`-vocab logits |
+| **D. MegaKDA Pallas DMA Overlap & Head-Inversion Packing** | `KDA_OVERLAP_H0_DMA=1`, `KDA_OVERLAP_HT_DMA=1`, `KDA_PACK_HEAD_INV=1`, `KDA_PACKED_METADATA=1` | Overlaps initial/final recurrent state (`h0`/`ht`) HBM DMAs with Pallas compute and packs head-inversion metadata across all `69` KDA layers |
+| **E. Native TPU Sparse Attention Indexer (`VllmTPUSparseAttnIndexer`)** | `VLLM_TPU_INDEXER_KV_CACHE_MODE=sal`, `TPU_SPARSE_MLA_NOPE_LAYOUT=sparsecore`, `TPU_SPARSE_MLA_ROPE_LAYOUT=sparsecore`, `TPU_MLA_SPARSE_SPLIT_Q=1` | Executes `streamindex_topk` (`topk=2048`) with SparseCore strided KV layout and Q-split sparse MLA Pallas kernels |
+
+### 2.5 `SGLang-TorchTPU` (`TP=32, EP=8`) Day-0 Recipe (`configs/sglang-torchtpu-kimi-k3.1-pro-tp32-ep8.py`)
+
+We also include the `SGLang-TorchTPU` (`origin/kimi-k31-pro-tpu`) Day-0 serving recipe ([`configs/sglang-torchtpu-kimi-k3.1-pro-tp32-ep8.py`](configs/sglang-torchtpu-kimi-k3.1-pro-tp32-ep8.py) and [`configs/sglang-torchtpu-kimi-k3.1-pro-megakernel.sh`](configs/sglang-torchtpu-kimi-k3.1-pro-megakernel.sh)):
+- **`tp_size=32, ep_size=8`**: Shards the `896` MXFP4 routed experts 8-way across the EP sub-mesh and shards expert intermediate dimension (`2048`) 4-way across the remaining TP axis (`8 × 4 = 32` TensorCores).
+- **`attention_backend="pallas_tpu_mla_sparse"`**: Executes DeepSeek Sparse Attention (`index_topk=2048`) on the `24` Gated MLA layers with `SGLANG_TPU_DSA_INDEXER_TOKEN_SPLIT=1` and SparseCore gather offload.
+- **Per-Op Pallas Decode Kernels & Decode MegaKernel**: Enables `SGLANG_TPU_KDA_DECODE_PALLAS=1`, `SGLANG_TPU_MLA_DECODE_PALLAS=1`, `SGLANG_TPU_MOE_DECODE_PALLAS=1`, and single-stream `sglang_tpu.k3_megakernel` with `RadixArk/Kimi-K3.1-Dflash2-Preview` / `RadixArk/Kimi-K3-DSpark` speculative decoding.
+
 ---
 
 ## 3. Repository Structure
 
 ```text
 kimi-k3.1-pro-tpu-v7x-inference/
-├── README.md                                         # Architecture, memory math, & benchmark results
-├── INFRA_SETUP.md                                    # Step-by-step GKE TPU v7x 2x2x4 & GCS FUSE setup guide
+├── README.md                                               # Architecture, memory math, & benchmark results
+├── INFRA_SETUP.md                                          # Step-by-step GKE TPU v7x 2x2x4 & GCS FUSE setup guide
 ├── configs/
-│   ├── kimi-k3.1-pro-tp8-dp4-ep32.sh                 # Config A: TP=8, DP=4, EP=32 (High-throughput mode)
-│   └── kimi-k3.1-pro-tp32-ep32.sh                    # Config B: TP=32, DP=1, EP=32 (Single-pool + SP prefill)
+│   ├── kimi-k3.1-pro-tp8-dp4-ep32.sh                       # vllm-torchtpu Config A: TP=8, DP=4, EP=32
+│   ├── kimi-k3.1-pro-tp32-ep32.sh                          # vllm-torchtpu Config B: TP=32, DP=1, EP=32 + SP Prefill
+│   ├── sglang-torchtpu-kimi-k3.1-pro-tp32-ep8.py           # SGLang-TorchTPU: TP=32, EP=8 + SparseCore DSA
+│   └── sglang-torchtpu-kimi-k3.1-pro-megakernel.sh         # SGLang-TorchTPU: Decode MegaKernel + Speculative Decoding
 ├── scripts/
-│   ├── stage_hf_to_gcs.py                            # Parallel multi-pod HF -> GCS staging & byte verifier
+│   ├── stage_hf_to_gcs.py                                  # Parallel multi-pod HF -> GCS staging & byte verifier
 │   └── patches/
-│       └── patch_vllm_torchtpu_kimi_k31.py           # Idempotent vllm + vllm-torchtpu runtime patch
+│       └── patch_vllm_torchtpu_kimi_k31.py                 # Idempotent vllm + vllm-torchtpu runtime patch
 ├── k8s/
-│   ├── provision_gke_dws_calendar.sh                 # GKE + TPU v7x 2x2x4 node pool provisioning script
-│   └── kimi-k3.1-pro-lws-v7x-16.yaml                 # 4-Pod LeaderWorkerSet manifest for 2x2x4 TPU v7x
+│   ├── provision_gke_dws_calendar.sh                       # GKE + TPU v7x 2x2x4 node pool provisioning script
+│   └── kimi-k3.1-pro-lws-v7x-16.yaml                       # 4-Pod LeaderWorkerSet manifest for 2x2x4 TPU v7x
 ├── benchmarks/
-│   └── run_kimi_k31_matrix.py                        # Async OpenAI streaming benchmark harness (Waves 1-3)
-└── results/                                          # Raw JSON benchmark outputs per wave and topology
+│   └── run_kimi_k31_matrix.py                              # Async OpenAI streaming benchmark harness (Waves 1-3)
+└── results/
+    └── vllm-tp8-dp4-ep32/                                  # Raw JSON & Markdown benchmark reports
 ```
 
 ---
@@ -86,42 +115,22 @@ python3 scripts/patches/patch_vllm_torchtpu_kimi_k31.py
 ### 2. Launch `vllm serve` (Leader Host 0)
 - **Throughput Mode (`TP=8, DP=4, EP=32`)**:
   ```bash
-  MODEL_DIR=/models/models/moonshotai/Kimi-K3.1-Pro \
-  RAY_HEAD_IP=$(hostname -i) \
+  MODEL_URI=/models/models/moonshotai/Kimi-K3.1-Pro \
   bash configs/kimi-k3.1-pro-tp8-dp4-ep32.sh
   ```
 - **Single-Pool / Sequence-Parallel Prefill Mode (`TP=32, DP=1, EP=32`)**:
   ```bash
-  MODEL_DIR=/models/models/moonshotai/Kimi-K3.1-Pro \
-  RAY_HEAD_IP=$(hostname -i) \
+  MODEL_URI=/models/models/moonshotai/Kimi-K3.1-Pro \
   bash configs/kimi-k3.1-pro-tp32-ep32.sh
   ```
 
 ### 3. Run the Benchmark Matrix
 ```bash
-# Wave 1: Regular Context (1k/1k, 8k/1k across concurrencies 1, 4, 8, 16, 32, 64)
+# Run all 3 waves (Regular Context, Long Context, and 64k Prefix Caching)
 python3 benchmarks/run_kimi_k31_matrix.py \
-  --base-url http://127.0.0.1:8000 \
-  --model /models/models/moonshotai/Kimi-K3.1-Pro \
-  --config-name tp8_dp4_ep32 \
-  --wave wave1 \
-  --output results/wave1_tp8_dp4_ep32.json
-
-# Wave 2: Long Context (64k/1k, 64k/4k, 128k/1k across concurrencies 1, 2, 4, 8, 16)
-python3 benchmarks/run_kimi_k31_matrix.py \
-  --base-url http://127.0.0.1:8000 \
-  --model /models/models/moonshotai/Kimi-K3.1-Pro \
-  --config-name tp8_dp4_ep32 \
-  --wave wave2 \
-  --output results/wave2_tp8_dp4_ep32.json
-
-# Wave 3: 64k Shared-Prefix Caching (--enable-prefix-caching --mamba-cache-mode align)
-python3 benchmarks/run_kimi_k31_matrix.py \
-  --base-url http://127.0.0.1:8000 \
-  --model /models/models/moonshotai/Kimi-K3.1-Pro \
-  --config-name tp8_dp4_ep32_prefix_cache \
-  --wave wave3 \
-  --output results/wave3_tp8_dp4_ep32_prefix_cache.json
+  --wave all \
+  --config-tag tp8-dp4-ep32 \
+  --output-dir results
 ```
 
 ---
@@ -129,28 +138,37 @@ python3 benchmarks/run_kimi_k31_matrix.py \
 ## 5. Benchmark Matrix & Live TPU v7x (`2x2x4`) Results
 
 > **Hardware**: `1×` TPU v7x `2x2x4` slice (`4` hosts × `4` chips = `16` physical chips = `32` TensorCores, `3,072 GB` HBM3e)  
-> **Runtime**: `vllm-torchtpu` (`TPU_UNIFIED_KV_CACHE_LAYOUT=1`, `TPU_MULTIHOST_BACKEND=ray`, `kv_cache_dtype=fp8`, native `compressed-tensors` `mxfp4-pack-quantized` routed experts + `BF16` shared experts/attention)
+> **Runtime**: `vllm-torchtpu` (`TPU_UNIFIED_KV_CACHE_LAYOUT=1`, `TPU_MULTIHOST_BACKEND=ray`, `kv_cache_dtype=fp8`, `--max-num-batched-tokens=2720`, native `compressed-tensors` `mxfp4-pack-quantized` routed experts + `BF16` shared experts/attention)  
+> **Raw Data**: [`results/vllm-tp8-dp4-ep32/summary.json`](results/vllm-tp8-dp4-ep32/summary.json) | [`results/vllm-tp8-dp4-ep32/REPORT.md`](results/vllm-tp8-dp4-ep32/REPORT.md)
 
-### 5.1 Baseline Reference (`TP=8, DP=4, EP=32`, Initial Validation Sweep)
+### 5.1 Wave 1: Regular Context (`1k / 1k`, `8k / 1k`) — `vllm-torchtpu` (`TP=8, DP=4, EP=32`)
 
-Prior to the full Wave 1–3 matrix sweep, initial hardware validation on a `2x2x4` TPU v7x slice (`TP=8, DP=4, EP=32`, `--gpu-memory-utilization=0.82`, `484` unified blocks/replica = `1,669,440` tokens total) established the following baseline:
+| Workload (`ISL / OSL`) | Concurrency | Output Throughput (`tok/s`) | Total Throughput (`tok/s`) | Stream `tok/s` (Mean) | TTFT P50 (`ms`) | TTFT P95 (`ms`) | TTFT P99 (`ms`) | TPOT P50 (`ms`) | TPOT P95 (`ms`) | ITL P50 (`ms`) | E2EL P50 (`s`) | OK / Fail |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **`1024 / 1024`** | `1` | **`15.25`** | **`31.63`** | `15.38` | `619.8` | `619.8` | `619.8` | `65.03` | `65.03` | `65.03` | `67.15` | `1 / 0` |
+| **`1024 / 1024`** | `4` | **`58.09`** | **`120.48`** | `14.73` | `1,193.3` | `1,193.7` | `1,193.7` | `67.76` | `68.27` | `67.79` | `70.52` | `4 / 0` |
+| **`1024 / 1024`** | `8` | **`104.96`** | **`217.71`** | `13.44` | `1,777.7` | `2,944.3` | `2,944.3` | `74.41` | `75.41` | `73.46` | `77.89` | `8 / 0` |
+| **`1024 / 1024`** | `16` | **`196.01`** | **`406.55`** | `12.71` | `2,969.2` | `3,561.4` | `4,143.7` | `78.69` | `79.70` | `77.31` | `82.95` | `16 / 0` |
+| **`1024 / 1024`** | `32` | **`364.03`** | **`755.06`** | `11.89` | `3,587.9` | `5,969.8` | `5,972.4` | `84.19` | `86.19` | `82.42` | `89.71` | `32 / 0` |
+| **`1024 / 1024`** | `64` | **`609.35`** | **`1,263.91`** | `10.06` | `5,539.2` | `9,706.0` | `9,709.7` | `99.69` | `103.10` | `96.21` | `107.00` | `64 / 0` |
+| **`8192 / 1024`** | `1` | **`14.49`** | **`131.48`** | `15.37` | `4,104.6` | `4,104.6` | `4,104.6` | `65.07` | `65.07` | `65.08` | `70.67` | `1 / 0` |
+| **`8192 / 1024`** | `4` | **`54.31`** | **`492.85`** | `14.59` | `5,466.3` | `6,015.1` | `6,015.1` | `68.81` | `69.32` | `67.83` | `75.34` | `4 / 0` |
+| **`8192 / 1024`** | `8` | **`93.95`** | **`852.91`** | `13.10` | `11,140.2` | `11,692.3` | `11,692.3` | `78.76` | `79.74` | `73.54` | `86.93` | `8 / 0` |
+| **`8192 / 1024`** | `16` | **`156.14`** | **`1,417.41`** | `11.64` | `17,643.5` | `25,718.7` | `25,719.3` | `88.53` | `95.39` | `77.45` | `104.19` | `16 / 0` |
+| **`8192 / 1024`** | `32` | **`241.34`** | **`2,190.81`** | `9.87` | `30,619.6` | `51,109.0` | `51,661.3` | `105.10` | `123.63` | `82.44` | `134.14` | `32 / 0` |
+| **`8192 / 1024`** | `64` | **`328.22`** | **`2,979.53`** | `7.46` | `56,357.9` | `101,580.1` | `101,583.5` | `141.62` | `181.84` | `96.29` | `196.36` | `64 / 0` |
 
-| Workload (`ISL / OSL`) | Concurrency | Median TTFT (`ms`) | P99 TTFT (`ms`) | Median TPOT (`ms`) | P99 TPOT (`ms`) | Output Throughput (`tok/s`) | Total Throughput (`tok/s`) |
-| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| **`1024 / 1024`** | `1` | `1,303.4` | `1,303.4` | `66.16` | `66.16` | `14.8` | `29.6` |
-| **`1024 / 1024`** | `8` | `977.6` | `989.1` | `86.25` | `86.41` | `87.3` | `174.5` |
-| **`1024 / 1024`** | `32` | `1,896.8` | `4,225.7` | `124.21` | `127.08` | `238.1` | `476.3` |
-| **`4096 / 1024`** | `8` | `1,910.4` | `3,389.4` | `84.88` | `86.10` | `88.7` | `443.4` |
-| **`8192 / 1024`** | `4` | `2,944.0` | `2,953.5` | `84.83` | `84.89` | `44.9` | `404.0` |
+### 5.2 Wave 2: Long Context (`64k / 1k`, `64k / 4k`, `128k / 1k`) — `vllm-torchtpu` (`TP=8, DP=4, EP=32`)
 
-### 5.2 Wave 1: Regular Context (`1k / 1k`, `8k / 1k`) — `TP=8, DP=4, EP=32` vs `TP=32, EP=32`
+> **Key Architectural Observation**: Because `69` of the `93` layers are constant-state linear KDA layers (`O(1)` decode memory bandwidth per token regardless of sequence length), single-stream decode latency at `64k` context (`65.60 ms` TPOT = `15.24 tok/s`) degrades by **`< 1%`** compared to `1k` context (`65.03 ms` TPOT = `15.38 tok/s`). At `c=16` (`>1.05M` active context tokens across `4` DP replicas), aggregate total throughput reaches **`3,820.36 tok/s`** while using only **`33.3%`** of the unified KV+KDA cache pool.
 
-*(Live Wave 1 benchmark tables across concurrencies `1, 4, 8, 16, 32, 64` are populated in `results/` as each wave completes.)*
+| Workload (`ISL / OSL`) | Concurrency | Output Throughput (`tok/s`) | Total Throughput (`tok/s`) | Stream `tok/s` (Mean) | TTFT P50 (`ms`) | TTFT P95 (`ms`) | TTFT P99 (`ms`) | TPOT P50 (`ms`) | TPOT P95 (`ms`) | ITL P50 (`ms`) | E2EL P50 (`s`) | OK / Fail |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **`65536 / 1024`** | `1` | **`10.51`** | **`684.14`** | `15.24` | `30,295.5` | `30,295.5` | `30,295.5` | `65.60` | `65.60` | `65.60` | `97.41` | `1 / 0` |
+| **`65536 / 1024`** | `2` | **`20.44`** | **`1,330.16`** | `14.92` | `31,294.3` | `31,886.3` | `31,886.3` | `66.77` | `67.28` | `66.76` | `100.12` | `2 / 0` |
+| **`65536 / 1024`** | `4` | **`38.95`** | **`2,534.81`** | `14.49` | `35,292.7` | `35,292.7` | `35,292.7` | `68.29` | `71.36` | `68.33` | `105.15` | `4 / 0` |
+| **`65536 / 1024`** | `8` | **`49.39`** | **`3,214.15`** | `10.67` | `86,849.2` | `89,813.8` | `89,813.8` | `123.90` | `127.48` | `74.65` | `165.64` | `8 / 0` |
+| **`65536 / 1024`** | `16` | **`58.70`** | **`3,820.36`** | `7.61` | `141,473.1` | `199,075.8` | `199,076.2` | `177.74` | `227.43` | `79.00` | `275.57` | `16 / 0` |
 
-### 5.3 Wave 2: Long Context (`64k / 1k`, `64k / 4k`, `128k / 1k`)
+*(Additional Wave 2 rows (`64k / 4k`, `128k / 1k`), Wave 3 `64k` Prefix Caching rows, and Pass 2/3 `SGLang-Optimized vllm-torchtpu` & `SGLang-TorchTPU` tables are committed as each sweep completes.)*
 
-*(Live Wave 2 benchmark tables across concurrencies `1, 2, 4, 8, 16` are populated in `results/` as each wave completes.)*
-
-### 5.4 Wave 3: Prefix Caching (`--enable-prefix-caching --mamba-cache-mode align` vs `--no-enable-prefix-caching`) on `64k` Context
-
-*(Live Wave 3 prefix-caching ablation tables (`0%`, `80%`, `95%` shared prefix across multi-turn `64k` workloads) are populated in `results/` as each wave completes.)*
