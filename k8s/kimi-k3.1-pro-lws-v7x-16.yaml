@@ -1,0 +1,271 @@
+apiVersion: leaderworkerset.x-k8s.io/v1
+kind: LeaderWorkerSet
+metadata:
+  name: kimi-k31-pro-v7x-16
+  namespace: default
+  annotations:
+    leaderworkerset.sigs.k8s.io/exclusive-topology: cloud.google.com/gke-nodepool
+spec:
+  replicas: 1
+  leaderWorkerTemplate:
+    size: 4
+    restartPolicy: RecreateGroupOnPodRestart
+    leaderTemplate:
+      metadata:
+        labels:
+          role: leader
+          app: kimi-k31-pro-v7x-16
+        annotations:
+          gke-gcsfuse/volumes: "true"
+          cluster-autoscaler.kubernetes.io/safe-to-evict: "false"
+      spec:
+        serviceAccountName: default
+        nodeSelector:
+          cloud.google.com/gke-tpu-accelerator: tpu7x
+          cloud.google.com/gke-tpu-topology: 2x2x4
+        tolerations:
+        - key: "google.com/tpu"
+          operator: "Exists"
+          effect: "NoSchedule"
+        containers:
+        - name: vllm-server
+          image: <YOUR_ARTIFACT_REGISTRY>/vllm/vllm-torchtpu-bench:v0.32.0
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/bash", "-c"]
+          args:
+          - |
+            set -eo pipefail
+            ulimit -c 0 || true
+            mkdir -p /dev/shm/hf_cache /dev/shm/vllm_tmp /dev/shm/vllm_cache /dev/shm/torchinductor
+            python3 /scripts/patch_vllm_torchtpu_kimi_k31.py
+            unset TORCH_TPU_TOPOLOGY
+            export TPU_PROCESS_ADDRESSES=""
+            export RAY_EXPERIMENTAL_NOSET_TPU_VISIBLE_CHIPS=1
+            ray start --head --port=6379 --labels="ray.io/tpu-worker-id=${TPU_WORKER_ID:-0}"
+            until [ "$(python3 -c 'import ray; ray.init(address="auto", logging_level="ERROR"); print(sum(1 for n in ray.nodes() if n["Alive"] and n.get("Resources", {}).get("TPU", 0) >= 8))' 2>/dev/null)" = "4" ]; do
+              echo "Waiting for all 4 Ironwood TPU v7x hosts (16 physical chips = 32 TensorCores, 3,072 GiB HBM3e) to join Ray..."
+              sleep 5
+            done
+            ray status
+            vllm serve "${MODEL_PATH}" \
+              --tokenizer="${TOKENIZER_PATH}" \
+              --served-model-name="${SERVED_MODEL_NAME}" \
+              --host=0.0.0.0 \
+              --port=8000 \
+              --api-server-count=1 \
+              --attention-backend=CUSTOM \
+              --tensor-parallel-size="${TP_SIZE:-8}" \
+              --data-parallel-size="${DP_SIZE:-4}" \
+              --enable-expert-parallel \
+              --enable-ep-weight-filter \
+              --language-model-only \
+              --limit-mm-per-prompt='{"image":0,"video":0}' \
+              --load-format=runai_streamer \
+              --safetensors-load-strategy=prefetch \
+              --model-loader-extra-config='{"memory_limit":8589934592,"concurrency":8}' \
+              --kv-cache-dtype=fp8 \
+              --gpu-memory-utilization=0.88 \
+              --max-model-len=131072 \
+              --max-num-seqs=32 \
+              --max-num-batched-tokens=1360 \
+              --block-size=256 \
+              --mamba-cache-mode=align \
+              --compilation-config='{"compile_sizes":[1,8,32,1360]}' \
+              --enable-prefix-caching \
+              --enable-prompt-tokens-details \
+              --reasoning-parser=kimi_k3 \
+              --tool-call-parser=kimi_k3 \
+              --enable-auto-tool-choice \
+              --async-scheduling \
+              --trust-remote-code
+          env:
+          - name: MODEL_PATH
+            value: "gs://<YOUR_GCS_BUCKET>/models/moonshotai/Kimi-K3.1-Pro"
+          - name: TOKENIZER_PATH
+            value: "/models/models/moonshotai/Kimi-K3.1-Pro"
+          - name: SERVED_MODEL_NAME
+            value: "moonshotai/Kimi-K3.1-Pro"
+          - name: TP_SIZE
+            value: "8"
+          - name: DP_SIZE
+            value: "4"
+          - name: TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL
+            value: "1"
+          - name: TPU_MOE_HIERARCHICAL_EP
+            value: "1"
+          - name: TPU_LATENT_PROJ_INTRA_CHIP_TP
+            value: "1"
+          - name: TPU_K3_SP_PREFILL
+            value: "1"
+          - name: RUNAI_STREAMER_PROCESS_GROUP_SIZE
+            value: "8"
+          - name: RUNAI_STREAMER_CONCURRENCY
+            value: "8"
+          - name: RUNAI_STREAMER_MEMORY_LIMIT
+            value: "8589934592"
+          - name: VLLM_TPU_WEIGHT_LOAD_SYNC_INTERVAL
+            value: "100"
+          - name: HF_HOME
+            value: "/dev/shm/hf_cache"
+          - name: TMPDIR
+            value: "/dev/shm/vllm_tmp"
+          - name: VLLM_CACHE_ROOT
+            value: "/dev/shm/vllm_cache"
+          - name: VLLM_XLA_CACHE_PATH
+            value: "/dev/shm/vllm_cache"
+          - name: TORCHINDUCTOR_CACHE_DIR
+            value: "/dev/shm/torchinductor"
+          - name: TORCHINDUCTOR_AUTOGRAD_CACHE
+            value: "0"
+          - name: VLLM_RAY_EXTRA_ENV_VARS_TO_COPY
+            value: "VLLM_PLUGINS,RUNAI_STREAMER_PROCESS_GROUP_SIZE,RUNAI_STREAMER_CONCURRENCY,RUNAI_STREAMER_MEMORY_LIMIT,VLLM_TPU_WEIGHT_LOAD_SYNC_INTERVAL,TORCH_DIST_TIMEOUT,TMPDIR,HF_HOME,TORCHINDUCTOR_CACHE_DIR,TORCHINDUCTOR_AUTOGRAD_CACHE,TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL,TPU_MOE_HIERARCHICAL_EP,TPU_LATENT_PROJ_INTRA_CHIP_TP,TPU_K3_SP_PREFILL"
+          - name: TPU_MULTIHOST_BACKEND
+            value: "ray"
+          - name: TPU_PROCESS_ADDRESSES
+            value: ""
+          - name: TPU_SKIP_MDS_QUERY
+            value: "1"
+          - name: RAY_EXPERIMENTAL_NOSET_TPU_VISIBLE_CHIPS
+            value: "1"
+          - name: VLLM_PLUGINS
+            value: "torchtpu,torchtpu_layers"
+          - name: VLLM_TARGET_DEVICE
+            value: "tpu"
+          - name: PJRT_DEVICE
+            value: "TPU"
+          - name: VLLM_WORKER_MULTIPROC_METHOD
+            value: "spawn"
+          - name: VLLM_NO_USAGE_STATS
+            value: "1"
+          ports:
+          - containerPort: 8000
+          resources:
+            limits:
+              google.com/tpu: "4"
+            requests:
+              google.com/tpu: "4"
+          volumeMounts:
+          - name: models-gcs
+            mountPath: /models
+          - name: dshm
+            mountPath: /dev/shm
+          - name: patch-script
+            mountPath: /scripts
+        volumes:
+        - name: dshm
+          emptyDir:
+            medium: Memory
+        - name: models-gcs
+          persistentVolumeClaim:
+            claimName: tpu-v7x-models-pvc
+        - name: patch-script
+          configMap:
+            name: kimi-k31-patch-script
+    workerTemplate:
+      metadata:
+        labels:
+          role: worker
+          app: kimi-k31-pro-v7x-16
+        annotations:
+          gke-gcsfuse/volumes: "true"
+          cluster-autoscaler.kubernetes.io/safe-to-evict: "false"
+      spec:
+        serviceAccountName: default
+        nodeSelector:
+          cloud.google.com/gke-tpu-accelerator: tpu7x
+          cloud.google.com/gke-tpu-topology: 2x2x4
+        tolerations:
+        - key: "google.com/tpu"
+          operator: "Exists"
+          effect: "NoSchedule"
+        containers:
+        - name: vllm-server
+          image: <YOUR_ARTIFACT_REGISTRY>/vllm/vllm-torchtpu-bench:v0.32.0
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/bash", "-c"]
+          args:
+          - |
+            set -eo pipefail
+            ulimit -c 0 || true
+            mkdir -p /dev/shm/hf_cache /dev/shm/vllm_tmp /dev/shm/vllm_cache /dev/shm/torchinductor
+            python3 /scripts/patch_vllm_torchtpu_kimi_k31.py
+            unset TORCH_TPU_TOPOLOGY
+            export TPU_PROCESS_ADDRESSES=""
+            export RAY_EXPERIMENTAL_NOSET_TPU_VISIBLE_CHIPS=1
+            python3 /workspace/vllm-torchtpu/.buildkite/kubernetes/warm_remote_code.py "${MODEL_PATH}"
+            until (echo > "/dev/tcp/${LWS_LEADER_ADDRESS}/6379") 2>/dev/null; do
+              echo "Waiting for Ray head at ${LWS_LEADER_ADDRESS}:6379..."
+              sleep 3
+            done
+            ray start --address="${LWS_LEADER_ADDRESS}:6379" --labels="ray.io/tpu-worker-id=${TPU_WORKER_ID:-0}" --block
+          env:
+          - name: MODEL_PATH
+            value: "gs://<YOUR_GCS_BUCKET>/models/moonshotai/Kimi-K3.1-Pro"
+          - name: TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL
+            value: "1"
+          - name: TPU_MOE_HIERARCHICAL_EP
+            value: "1"
+          - name: TPU_LATENT_PROJ_INTRA_CHIP_TP
+            value: "1"
+          - name: TPU_K3_SP_PREFILL
+            value: "1"
+          - name: RUNAI_STREAMER_PROCESS_GROUP_SIZE
+            value: "8"
+          - name: RUNAI_STREAMER_CONCURRENCY
+            value: "8"
+          - name: RUNAI_STREAMER_MEMORY_LIMIT
+            value: "8589934592"
+          - name: VLLM_TPU_WEIGHT_LOAD_SYNC_INTERVAL
+            value: "100"
+          - name: HF_HOME
+            value: "/dev/shm/hf_cache"
+          - name: TMPDIR
+            value: "/dev/shm/vllm_tmp"
+          - name: VLLM_CACHE_ROOT
+            value: "/dev/shm/vllm_cache"
+          - name: VLLM_XLA_CACHE_PATH
+            value: "/dev/shm/vllm_cache"
+          - name: TORCHINDUCTOR_CACHE_DIR
+            value: "/dev/shm/torchinductor"
+          - name: TORCHINDUCTOR_AUTOGRAD_CACHE
+            value: "0"
+          - name: TPU_MULTIHOST_BACKEND
+            value: "ray"
+          - name: TPU_PROCESS_ADDRESSES
+            value: ""
+          - name: TPU_SKIP_MDS_QUERY
+            value: "1"
+          - name: RAY_EXPERIMENTAL_NOSET_TPU_VISIBLE_CHIPS
+            value: "1"
+          - name: VLLM_PLUGINS
+            value: "torchtpu,torchtpu_layers"
+          - name: VLLM_TARGET_DEVICE
+            value: "tpu"
+          - name: PJRT_DEVICE
+            value: "TPU"
+          - name: VLLM_WORKER_MULTIPROC_METHOD
+            value: "spawn"
+          - name: VLLM_NO_USAGE_STATS
+            value: "1"
+          resources:
+            limits:
+              google.com/tpu: "4"
+            requests:
+              google.com/tpu: "4"
+          volumeMounts:
+          - name: models-gcs
+            mountPath: /models
+          - name: dshm
+            mountPath: /dev/shm
+          - name: patch-script
+            mountPath: /scripts
+        volumes:
+        - name: dshm
+          emptyDir:
+            medium: Memory
+        - name: models-gcs
+          persistentVolumeClaim:
+            claimName: tpu-v7x-models-pvc
+        - name: patch-script
+          configMap:
+            name: kimi-k31-patch-script
