@@ -91,6 +91,8 @@ kimi-k3.1-pro-tpu-v7x-inference/
 │   └── sglang-torchtpu-kimi-k3.1-pro-megakernel.sh         # SGLang-TorchTPU: Decode MegaKernel + Speculative Decoding
 ├── scripts/
 │   ├── stage_hf_to_gcs.py                                  # Parallel multi-pod HF -> GCS staging & byte verifier
+│   ├── relaunch_pass2_vllm_sglang_opt.sh                   # Turnkey Pass 2 launcher: vllm-torchtpu + SGLang HW optimizations
+│   ├── relaunch_pass3_sglang_day0.sh                       # Turnkey Pass 3 launcher: SGLang-TorchTPU Day-0 (TP=32, EP=8)
 │   └── patches/
 │       └── patch_vllm_torchtpu_kimi_k31.py                 # Idempotent vllm + vllm-torchtpu runtime patch
 ├── k8s/
@@ -99,7 +101,7 @@ kimi-k3.1-pro-tpu-v7x-inference/
 ├── benchmarks/
 │   └── run_kimi_k31_matrix.py                              # Async OpenAI streaming benchmark harness (Waves 1-3)
 └── results/
-    └── vllm-tp8-dp4-ep32/                                  # Raw JSON & Markdown benchmark reports
+    └── vllm-tp8-dp4-ep32/                                  # Raw JSON & Markdown benchmark reports (32 rows, Waves 1-3)
 ```
 
 ---
@@ -160,7 +162,12 @@ python3 benchmarks/run_kimi_k31_matrix.py \
 
 ### 5.2 Wave 2: Long Context (`64k / 1k`, `64k / 4k`, `128k / 1k`) — `vllm-torchtpu` (`TP=8, DP=4, EP=32`)
 
-> **Key Architectural Observation**: Because `69` of the `93` layers are constant-state linear KDA layers (`O(1)` decode memory bandwidth per token regardless of sequence length), single-stream decode latency at `64k` context (`65.60 ms` TPOT = `15.24 tok/s`) degrades by **`< 1%`** compared to `1k` context (`65.03 ms` TPOT = `15.38 tok/s`). At `c=16` (`>1.05M` active context tokens across `4` DP replicas), aggregate total throughput reaches **`3,820.36 tok/s`** while using only **`33.3%`** of the unified KV+KDA cache pool.
+> **Key Architectural Observation**: Because `69` of the `93` layers are constant-state linear KDA layers (`O(1)` decode memory bandwidth per token regardless of sequence length), single-stream decode latency degrades by **`< 1.7%` across a `128×` context increase**:
+> - `1k` context: **`65.03 ms`** TPOT (`15.38 tok/s`)
+> - `64k` context: **`65.60 ms`** TPOT (`15.24 tok/s`, `-0.87%`)
+> - `128k` context: **`66.14 ms`** TPOT (`15.12 tok/s`, `-1.69%`)
+>
+> At `64k / 1k` `c=16` (`>1.05M` active context tokens across `4` DP replicas), aggregate total throughput reaches **`3,820.36 tok/s`** while using only **`33.3%`** of the unified KV+KDA cache pool. At `128k / 1k` `c=4` (`524,288` active context tokens), aggregate total throughput reaches **`3,640.33 tok/s`** (`28.87` output tok/s) with **`68.86 ms` TPOT P50**.
 
 | Workload (`ISL / OSL`) | Concurrency | Output Throughput (`tok/s`) | Total Throughput (`tok/s`) | Stream `tok/s` (Mean) | TTFT P50 (`ms`) | TTFT P95 (`ms`) | TTFT P99 (`ms`) | TPOT P50 (`ms`) | TPOT P95 (`ms`) | ITL P50 (`ms`) | E2EL P50 (`s`) | OK / Fail |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
@@ -172,48 +179,46 @@ python3 benchmarks/run_kimi_k31_matrix.py \
 | **`65536 / 4096`** | `1` | **`13.71`** | **`233.39`** | `15.25` | `30,229.4` | `30,229.4` | `30,229.4` | `65.56` | `65.56` | `65.56` | `298.70` | `1 / 0` |
 | **`65536 / 4096`** | `2` | **`26.59`** | **`452.56`** | `14.89` | `31,253.6` | `34,549.6` | `34,549.6` | `66.79` | `67.55` | `66.80` | `307.87` | `2 / 0` |
 | **`65536 / 4096`** | `4` | **`51.92`** | **`883.74`** | `14.57` | `35,293.2` | `35,294.7` | `35,294.7` | `68.43` | `69.20` | `68.44` | `315.53` | `4 / 0` |
-| **`130048 / 1024`** | `1` | **`7.73`** | **`974.66`** | `15.12` | `64,795.2` | `64,795.2` | `64,795.2` | `66.14` | `66.14` | `66.15` | `132.46` | `1 / 0` |
-| **`130048 / 1024`** | `2` | **`14.75`** | **`1,859.95`** | `14.49` | `66,166.8` | `69,990.0` | `69,990.0` | `67.29` | `70.82` | `67.28` | `138.62` | `2 / 0` |
-| **`130048 / 1024`** | `4` | **`28.87`** | **`3,640.33`** | `14.34` | `71,412.7` | `71,414.0` | `71,414.0` | `68.86` | `72.44` | `68.88` | `141.86` | `4 / 0` |
+| **`131072 / 1024`** | `1` | **`7.73`** | **`974.66`** | `15.12` | `64,795.2` | `64,795.2` | `64,795.2` | `66.14` | `66.14` | `66.15` | `132.46` | `1 / 0` |
+| **`131072 / 1024`** | `2` | **`14.75`** | **`1,859.95`** | `14.49` | `66,166.8` | `69,990.0` | `69,990.0` | `67.29` | `70.82` | `67.28` | `138.62` | `2 / 0` |
+| **`131072 / 1024`** | `4` | **`28.87`** | **`3,640.33`** | `14.34` | `71,412.7` | `71,414.0` | `71,414.0` | `68.86` | `72.44` | `68.88` | `141.86` | `4 / 0` |
 
-### 5.3 Wave 3: `64k` Prefix Caching (`0%` Miss vs. `80%` Hit vs. `95%` Hit) — `vllm-torchtpu` (`TP=8, DP=4, EP=32`)
+### 5.3 Wave 3: `64k` Prefix Caching (`0%` Miss vs `80%` Hit vs `95%` Hit) — `vllm-torchtpu` (`TP=8, DP=4, EP=32`)
 
-> **Key Prefix Caching Observation**: With `--enable-prefix-caching --mamba-cache-mode align` (`block_size=1360` unified MLA+KDA state checkpoints), a `95%` shared `64k` prefix (`93.2%` block-aligned cache hit) reduces single-stream TTFT P50 by **`11.1×`** (`30,295.5 ms -> 2,733.4 ms`) and boosts `c=8` total throughput by **`1.94×`** (`3,214.15 tok/s -> 6,235.01 tok/s`, **`95.78` output tok/s**).
+> **How Hybrid KDA + MLA Prefix Caching Works (`--enable-prefix-caching --mamba-cache-mode=align`)**:
+> In `vllm/v1/core/single_type_kv_cache_manager.py` (`MambaCacheManager`), `remove_skipped_blocks` frees interior Mamba/KDA recurrent state blocks during prefill to conserve HBM and retains the recurrent state checkpoint at the replay boundary (`(num_prompt_tokens - 1) // 1360`) of Turn 1. When Turn 1 warms the shared prefix (`38` aligned blocks = `51,680` tokens for `80%` target, or `45` aligned blocks = `61,200` tokens for `95%` target), Turn 2 (`65,536` input tokens) restores both the `24` Gated MLA FP8 KV blocks and the `69` KDA recurrent state checkpoints at the exact block boundary:
+> - **At `80%` Target (`78.7%` / `51,680` cached tokens)**: TTFT P50 drops from `30,295.5 ms` to **`7,369.5 ms` (`4.11×` speedup)** at `c=1`, and from `86,849.2 ms` to **`20,524.7 ms` (`4.23×` speedup)** at `c=8`, lifting total throughput to **`5,350.97 tok/s`**.
+> - **At `95%` Target (`93.2%` / `61,200` cached tokens)**: TTFT P50 drops from `30,295.5 ms` to **`2,733.4 ms` (`11.08×` speedup)** at `c=1`, and from `86,849.2 ms` to **`7,369.1 ms` (`11.79×` speedup)** at `c=8`, lifting output throughput by **`1.94×` (`95.78` vs `49.39 tok/s`)** and total throughput to **`6,235.01 tok/s`**.
 
-| Workload (`65536 / 1024`) | Concurrency | Target Cache % | Observed Cache % | Output Throughput (`tok/s`) | Total Throughput (`tok/s`) | Stream `tok/s` (Mean) | TTFT P50 (`ms`) | TTFT P95 (`ms`) | TPOT P50 (`ms`) | ITL P50 (`ms`) | E2EL P50 (`s`) | OK / Fail |
+| Workload (`65536 / 1024`) | Concurrency | Target Cache % | Observed Cache % (`Cached Tokens`) | Output Throughput (`tok/s`) | Total Throughput (`tok/s`) | TTFT Speedup vs `0%` | TTFT P50 (`ms`) | TTFT P95 (`ms`) | TPOT P50 (`ms`) | ITL P50 (`ms`) | E2EL P50 (`s`) | OK / Fail |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| **`64k_1k_0pct_miss`** | `1` | `0.0%` | `0.0%` | **`10.51`** | **`684.14`** | `15.24` | `30,295.5` | `30,295.5` | `65.60` | `65.60` | `97.41` | `1 / 0` |
-| **`64k_1k_0pct_miss`** | `4` | `0.0%` | `0.0%` | **`38.95`** | **`2,534.81`** | `14.49` | `35,292.7` | `35,292.7` | `68.29` | `68.33` | `105.15` | `4 / 0` |
-| **`64k_1k_0pct_miss`** | `8` | `0.0%` | `0.0%` | **`49.39`** | **`3,214.15`** | `10.67` | `86,849.2` | `89,813.8` | `123.90` | `74.65` | `165.64` | `8 / 0` |
-| **`64k_1k_80pct_hit`** | `1` | `80.0%` | `78.7%` | **`13.75`** | **`895.26`** | `15.25` | `7,369.5` | `7,369.5` | `65.58` | `65.59` | `74.46` | `1 / 0` |
-| **`64k_1k_80pct_hit`** | `4` | `80.0%` | `78.7%` | **`50.26`** | **`3,272.09`** | `14.48` | `11,573.8` | `11,573.9` | `68.34` | `68.35` | `81.48` | `4 / 0` |
-| **`64k_1k_80pct_hit`** | `8` | `80.0%` | `78.7%` | **`82.20`** | **`5,350.97`** | `12.49` | `20,524.7` | `23,491.0` | `84.78` | `74.71` | `99.44` | `8 / 0` |
-| **`64k_1k_95pct_hit`** | `1` | `95.0%` | `93.2%` | **`14.67`** | **`955.05`** | `15.25` | `2,733.4` | `2,733.4` | `65.55` | `65.56` | `69.80` | `1 / 0` |
-| **`64k_1k_95pct_hit`** | `4` | `95.0%` | `93.2%` | **`54.37`** | **`3,539.62`** | `14.51` | `5,446.4` | `5,446.7` | `68.31` | `68.33` | `75.33` | `4 / 0` |
-| **`64k_1k_95pct_hit`** | `8` | `95.0%` | `93.2%` | **`95.78`** | **`6,235.01`** | `13.14` | `7,369.1` | `9,153.8` | `76.26` | `74.72` | `85.38` | `8 / 0` |
+| **`64k_1k_0pct_miss`** | `1` | `0.0%` | `0.0%` (`0`) | **`10.51`** | **`684.14`** | `1.00×` | `30,295.5` | `30,295.5` | `65.60` | `65.60` | `97.41` | `1 / 0` |
+| **`64k_1k_0pct_miss`** | `4` | `0.0%` | `0.0%` (`0`) | **`38.95`** | **`2,534.81`** | `1.00×` | `35,292.7` | `35,292.7` | `68.29` | `68.33` | `105.15` | `4 / 0` |
+| **`64k_1k_0pct_miss`** | `8` | `0.0%` | `0.0%` (`0`) | **`49.39`** | **`3,214.15`** | `1.00×` | `86,849.2` | `89,813.8` | `123.90` | `74.65` | `165.64` | `8 / 0` |
+| **`64k_1k_80pct_hit`** | `1` | `80.0%` | **`78.7%`** (`51,680`) | **`13.75`** | **`895.26`** | **`4.11×`** | **`7,369.5`** | `7,369.5` | `65.58` | `65.59` | `74.46` | `1 / 0` |
+| **`64k_1k_80pct_hit`** | `4` | `80.0%` | **`78.7%`** (`51,680`) | **`50.26`** | **`3,272.09`** | **`3.05×`** | **`11,573.8`** | `11,573.9` | `68.34` | `68.35` | `81.48` | `4 / 0` |
+| **`64k_1k_80pct_hit`** | `8` | `80.0%` | **`78.7%`** (`51,680`) | **`82.20`** | **`5,350.97`** | **`4.23×`** | **`20,524.7`** | `23,491.0` | `84.78` | `74.71` | `99.44` | `8 / 0` |
+| **`64k_1k_95pct_hit`** | `1` | `95.0%` | **`93.2%`** (`61,200`) | **`14.67`** | **`955.05`** | **`11.08×`** | **`2,733.4`** | `2,733.4` | `65.55` | `65.56` | `69.80` | `1 / 0` |
+| **`64k_1k_95pct_hit`** | `4` | `95.0%` | **`93.2%`** (`61,200`) | **`54.37`** | **`3,539.62`** | **`6.48×`** | **`5,446.4`** | `5,446.7` | `68.31` | `68.33` | `75.33` | `4 / 0` |
+| **`64k_1k_95pct_hit`** | `8` | `95.0%` | **`93.2%`** (`61,200`) | **`95.78`** | **`6,235.01`** | **`11.79×`** | **`7,369.1`** | `9,153.8` | `76.26` | `74.72` | `85.38` | `8 / 0` |
 
 ---
 
 ## 6. Turnkey Relaunch Scripts for Pass 2 & Pass 3
 
-All scripts and patches for **Pass 2 (`vllm-torchtpu` + SGLang-inspired hardware/kernel optimizations)** and **Pass 3 (`sglang-torchtpu` Day-0 `origin/kimi-k31-pro-tpu` + MegaKernel + DFlash2)** are saved in [`scripts/`](scripts/) and [`configs/`](configs/) for one-command relaunch whenever the `2x2x4` TPU v7x slice is available:
+All configurations, runtime patches, and benchmark automation scripts for **Pass 2 (`vllm-torchtpu` with SGLang-inspired hardware & Pallas optimizations)** and **Pass 3 (`sglang-torchtpu` Day-0 `TP=32, EP=8` + SparseCore DSA)** are pre-staged in [`scripts/`](scripts/) (and backed up on the shared GCS FUSE mount at `/models/kimi_k31_relaunch/`).
 
-### 6.1 Relaunch Pass 2 (`vllm-torchtpu` with SGLang-Inspired Hardware & Kernel Optimizations)
+### 6.1 Relaunch Pass 2 (`vllm-torchtpu` with SGLang Hardware Optimizations)
+- **Pass 2B (`TP=32, DP=1, EP=32` + `TPU_K3_SP_PREFILL=1` + SparseCore Gather Offload + Fused MoE Decode + MegaKDA DMA Overlap)**:
+  ```bash
+  TOPOLOGY=tp32-ep32 WAVE=all bash scripts/relaunch_pass2_vllm_sglang_opt.sh
+  ```
+- **Pass 2A (`TP=8, DP=4, EP=32` + SparseCore Gather Offload + Fused MoE Decode + MegaKDA DMA Overlap)**:
+  ```bash
+  TOPOLOGY=tp8-dp4-ep32 WAVE=all bash scripts/relaunch_pass2_vllm_sglang_opt.sh
+  ```
+
+### 6.2 Relaunch Pass 3 (`sglang-torchtpu` Day-0 `TP=32, EP=8` + SparseCore DSA)
 ```bash
-# Run TP=32, EP=32 with TPU_K3_SP_PREFILL=1, tuned v2 MLA Pallas table (block_size=256),
-# Ironwood SparseCore gather offload, Fused MoE Decode kernel, and MegaKDA DMA overlap:
-TOPOLOGY_MODE=tp32 bash scripts/relaunch_pass2_vllm_sglang_opt.sh
-
-# Or run TP=8, DP=4, EP=32 with the same SGLang-inspired hardware/kernel optimizations:
-TOPOLOGY_MODE=tp8-dp4 bash scripts/relaunch_pass2_vllm_sglang_opt.sh
+WAVE=all bash scripts/relaunch_pass3_sglang_day0.sh
 ```
-
-### 6.2 Relaunch Pass 3 (`sglang-torchtpu` Day-0 `origin/kimi-k31-pro-tpu` + MegaKernel / DFlash2)
-```bash
-# Run TP=32, EP=8 with SparseCore DSA (pallas_tpu_mla_sparse, index_topk=2048) & Per-Op Pallas Decode Kernels:
-EXEC_MODE=server bash scripts/relaunch_pass3_sglang_day0.sh
-
-# Or run the single-stream Decode MegaKernel + DFlash2 / DSpark speculative decoding benchmark:
-EXEC_MODE=megakernel bash scripts/relaunch_pass3_sglang_day0.sh
-```
-

@@ -251,7 +251,7 @@ async def run_sweep_point(
     conn = aiohttp.TCPConnector(limit=max(128, concurrency * 2))
     async with aiohttp.ClientSession(connector=conn) as session:
         # If testing prefix cache hit > 0, warm the shared prefix across all DP engines (12 requests).
-        # Under --mamba-cache-mode=align, MambaCacheManager retains the KDA state snapshot at the
+        # Under --mamba-cache-mode=align, MambaCacheManager retains the KDA state checkpoint at the
         # replay boundary (last full 1360-token block) of Turn 1, so Turn 1 must be the shared prefix itself.
         if prefix_hit_ratio > 0.0:
             warm_count = 12
