@@ -250,18 +250,17 @@ async def run_sweep_point(
 
     conn = aiohttp.TCPConnector(limit=max(128, concurrency * 2))
     async with aiohttp.ClientSession(connector=conn) as session:
-        # If testing prefix cache hit > 0, warm the shared prefix across all DP engines (12 requests)
+        # If testing prefix cache hit > 0, warm the shared prefix across all DP engines (12 requests).
+        # Under --mamba-cache-mode=align, MambaCacheManager retains the KDA state snapshot at the
+        # replay boundary (last full 1360-token block) of Turn 1, so Turn 1 must be the shared prefix itself.
         if prefix_hit_ratio > 0.0:
             warm_count = 12
             warm_sem = asyncio.Semaphore(4)
-            warm_prompt = builder.build_prompt(
-                input_tokens=input_tokens,
-                req_idx=999999,
-                prefix_hit_ratio=prefix_hit_ratio,
-                shared_session_id=shared_session,
-            )
+            usable_tokens = max(32, input_tokens - 24)
+            shared_tokens = int(usable_tokens * prefix_hit_ratio)
+            warm_prompt = builder.get_shared_prefix(shared_tokens, shared_session)
             print(
-                f"[kimi-k31-bench] Warming shared prefix ({int(prefix_hit_ratio*100)}% of {input_tokens} toks) across DP ranks ({warm_count} warmup reqs)...",
+                f"[kimi-k31-bench] Warming shared prefix ({int(prefix_hit_ratio*100)}% = {shared_tokens} toks) across DP ranks ({warm_count} warmup reqs)...",
                 flush=True,
             )
             warm_tasks = [
@@ -515,11 +514,26 @@ def main() -> None:
 
     # Wave 3: Prefix Caching on 64k shared-prefix multi-turn workloads
     if args.wave in ("all", "prefix_caching"):
+        long_64k_by_c = {
+            r.get("concurrency"): r
+            for r in all_rows
+            if r.get("suite") == "long_context"
+            and r.get("workload") == "64k_1k"
+            and r.get("successful", 0) > 0
+        }
         for hit_ratio, tag_suffix in [(0.0, "0pct_miss"), (0.8, "80pct_hit"), (0.95, "95pct_hit")]:
             for c in pref_concs:
                 wtag = f"64k_1k_{tag_suffix}"
                 if ("prefix_caching_64k", wtag, c) in existing_keys:
                     print(f"[kimi-k31-bench] Skipping completed prefix_caching_64k {wtag} c={c}", flush=True)
+                    continue
+                if hit_ratio == 0.0 and c in long_64k_by_c:
+                    row = dict(long_64k_by_c[c])
+                    row["suite"] = "prefix_caching_64k"
+                    row["workload"] = wtag
+                    print(f"[kimi-k31-bench] Reusing 0% miss baseline from long_context 64k_1k c={c}: {json.dumps(row)}", flush=True)
+                    all_rows.append(row)
+                    save_incremental(out_dir, meta, all_rows)
                     continue
                 n_prompts = c
                 row = asyncio.run(
