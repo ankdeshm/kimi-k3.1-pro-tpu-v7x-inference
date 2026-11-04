@@ -66,24 +66,26 @@ class PromptBuilder:
                 print(f"[kimi-k31-bench] Loaded tokenizer from {tokenizer_path}", flush=True)
             except Exception as exc:
                 print(f"[kimi-k31-bench] Fallback word calibration ({exc})", flush=True)
-        self._shared_block_cache: dict[int, str] = {}
+        self._shared_block_cache: dict[tuple[int, str], str] = {}
+        self._body_cache: dict[int, str] = {}
 
     def _make_token_calibrated_text(self, target_tokens: int, seed_tag: str) -> str:
-        # Each "<word> " in Kimi's 163,840 tiktoken vocab is ~1.0 token.
-        n_words = max(16, target_tokens)
-        offset = abs(hash(seed_tag)) % len(VOCAB_WORDS)
-        body = " ".join(VOCAB_WORDS[(i + offset) % len(VOCAB_WORDS)] for i in range(n_words))
-        text = f"[{seed_tag}] {body}"
-        if self.tokenizer is not None:
-            ids = self.tokenizer.encode(text, add_special_tokens=False)
-            if len(ids) > target_tokens:
-                ids = ids[:target_tokens]
-                text = self.tokenizer.decode(ids)
-            elif len(ids) < target_tokens:
-                pad_ids = ids * ((target_tokens - len(ids)) // max(len(ids), 1) + 2)
-                ids = (ids + pad_ids)[:target_tokens]
-                text = self.tokenizer.decode(ids)
-        return text
+        prefix = f"[{seed_tag}] "
+        body_tokens = max(8, target_tokens - 8)
+        if body_tokens not in self._body_cache:
+            n_words = max(16, body_tokens)
+            body = " ".join(VOCAB_WORDS[i % len(VOCAB_WORDS)] for i in range(n_words))
+            if self.tokenizer is not None:
+                ids = self.tokenizer.encode(body, add_special_tokens=False)
+                if len(ids) > body_tokens:
+                    ids = ids[:body_tokens]
+                    body = self.tokenizer.decode(ids)
+                elif len(ids) < body_tokens:
+                    pad_ids = ids * ((body_tokens - len(ids)) // max(len(ids), 1) + 2)
+                    ids = (ids + pad_ids)[:body_tokens]
+                    body = self.tokenizer.decode(ids)
+            self._body_cache[body_tokens] = body
+        return prefix + self._body_cache[body_tokens]
 
     def get_shared_prefix(self, shared_tokens: int, session_id: str) -> str:
         key = (shared_tokens, session_id)
@@ -150,7 +152,9 @@ async def _one_request(
     async with sem:
         t0 = time.perf_counter()
         first_tok_t: float | None = None
+        prev_tok_t: float | None = None
         last_tok_t: float | None = None
+        itls_ms: list[float] = []
         chunks = 0
         usage_in = 0
         usage_out = 0
@@ -181,6 +185,9 @@ async def _one_request(
                             now = time.perf_counter()
                             if first_tok_t is None:
                                 first_tok_t = now
+                            elif prev_tok_t is not None:
+                                itls_ms.append((now - prev_tok_t) * 1000.0)
+                            prev_tok_t = now
                             last_tok_t = now
                             chunks += 1
                     usage = obj.get("usage")
@@ -201,6 +208,7 @@ async def _one_request(
         decode_s = max((last_tok_t or t_end) - first_tok_t, 1e-6)
         e2e_s = max(t_end - t0, 1e-6)
         tpot_ms = (decode_s * 1000.0) / max(1, out_toks - 1) if out_toks > 1 else 0.0
+        itl_mean_ms = sum(itls_ms) / len(itls_ms) if itls_ms else tpot_ms
         stream_tps = (out_toks - 1) / decode_s if out_toks > 1 else out_toks / e2e_s
         return {
             "ok": True,
@@ -209,6 +217,8 @@ async def _one_request(
             "cached_tokens": cached_toks,
             "ttft_ms": ttft_ms,
             "tpot_ms": tpot_ms,
+            "itl_mean_ms": itl_mean_ms,
+            "itls_ms": itls_ms,
             "e2e_s": e2e_s,
             "stream_tps": stream_tps,
         }
@@ -240,13 +250,25 @@ async def run_sweep_point(
 
     conn = aiohttp.TCPConnector(limit=max(128, concurrency * 2))
     async with aiohttp.ClientSession(connector=conn) as session:
-        # If testing prefix cache hit > 0, warm the shared prefix once so subsequent concurrent requests hit it
+        # If testing prefix cache hit > 0, warm the shared prefix across all DP engines (12 requests)
         if prefix_hit_ratio > 0.0:
+            warm_count = 12
+            warm_sem = asyncio.Semaphore(4)
+            warm_prompt = builder.build_prompt(
+                input_tokens=input_tokens,
+                req_idx=999999,
+                prefix_hit_ratio=prefix_hit_ratio,
+                shared_session_id=shared_session,
+            )
             print(
-                f"[kimi-k31-bench] Warming shared prefix ({int(prefix_hit_ratio*100)}% of {input_tokens} toks)...",
+                f"[kimi-k31-bench] Warming shared prefix ({int(prefix_hit_ratio*100)}% of {input_tokens} toks) across DP ranks ({warm_count} warmup reqs)...",
                 flush=True,
             )
-            await _one_request(session, base_url, model_id, prompts[0], min(16, output_tokens), sem)
+            warm_tasks = [
+                _one_request(session, base_url, model_id, warm_prompt, 4, warm_sem)
+                for _ in range(warm_count)
+            ]
+            await asyncio.gather(*warm_tasks)
 
         t0 = time.perf_counter()
         tasks = [
@@ -282,6 +304,7 @@ async def run_sweep_point(
     total_cached = sum(r["cached_tokens"] for r in ok_res)
     ttfts = [r["ttft_ms"] for r in ok_res]
     tpots = [r["tpot_ms"] for r in ok_res]
+    all_itls = [x for r in ok_res for x in r.get("itls_ms", [])] or tpots
     e2es = [r["e2e_s"] for r in ok_res]
     stpss = [r["stream_tps"] for r in ok_res]
 
@@ -307,13 +330,20 @@ async def run_sweep_point(
         "ttft_mean_ms": round(sum(ttfts) / len(ttfts), 1),
         "ttft_p50_ms": round(pct(ttfts, 50), 1),
         "ttft_p90_ms": round(pct(ttfts, 90), 1),
+        "ttft_p95_ms": round(pct(ttfts, 95), 1),
         "ttft_p99_ms": round(pct(ttfts, 99), 1),
         "tpot_mean_ms": round(sum(tpots) / len(tpots), 2),
         "tpot_p50_ms": round(pct(tpots, 50), 2),
         "tpot_p90_ms": round(pct(tpots, 90), 2),
+        "tpot_p95_ms": round(pct(tpots, 95), 2),
         "tpot_p99_ms": round(pct(tpots, 99), 2),
+        "itl_mean_ms": round(sum(all_itls) / len(all_itls), 2),
+        "itl_p50_ms": round(pct(all_itls, 50), 2),
+        "itl_p95_ms": round(pct(all_itls, 95), 2),
+        "itl_p99_ms": round(pct(all_itls, 99), 2),
         "e2el_mean_s": round(sum(e2es) / len(e2es), 2),
         "e2el_p50_s": round(pct(e2es, 50), 2),
+        "e2el_p95_s": round(pct(e2es, 95), 2),
         "e2el_p99_s": round(pct(e2es, 99), 2),
     }
     print(f"[kimi-k31-bench] RESULT: {json.dumps(row)}", flush=True)
@@ -329,21 +359,22 @@ def render_markdown(meta: dict, rows: list[dict]) -> str:
         f"- **Hardware Topology**: `{meta['slice_name']}` (`16` physical TPU v7x chips = `32` TensorCores, `3,072 GB` HBM3e)",
         f"- **Configuration Tag**: `{meta['config_tag']}`",
         "",
-        "| Suite | Workload | Concurrency | Target Cache % | Observed Cache % | Output tok/s | Total tok/s | Stream tok/s (Mean) | TTFT P50 (ms) | TTFT P90 (ms) | TPOT P50 (ms) | TPOT P90 (ms) | E2EL P50 (s) | OK/Fail |",
-        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| Suite | Workload | Concurrency | Target Cache % | Observed Cache % | Output tok/s | Total tok/s | Stream tok/s (Mean) | TTFT P50 (ms) | TTFT P95 (ms) | TTFT P99 (ms) | TPOT P50 (ms) | TPOT P95 (ms) | TPOT P99 (ms) | ITL P50 (ms) | E2EL P50 (s) | OK/Fail |",
+        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for r in rows:
         if r.get("successful", 0) == 0:
             lines.append(
-                f"| `{r['suite']}` | `{r['workload']}` | {r['concurrency']} | {r['prefix_hit_target_pct']}% | - | ERR | ERR | - | - | - | - | - | - | 0/{r.get('failed', 0)} |"
+                f"| `{r['suite']}` | `{r['workload']}` | {r['concurrency']} | {r['prefix_hit_target_pct']}% | - | ERR | ERR | - | - | - | - | - | - | - | - | - | 0/{r.get('failed', 0)} |"
             )
         else:
             lines.append(
                 f"| `{r['suite']}` | `{r['workload']}` | {r['concurrency']} | "
                 f"{r['prefix_hit_target_pct']}% | {r['observed_prefix_hit_pct']}% | "
                 f"**{r['output_tok_s']}** | **{r['total_tok_s']}** | {r['stream_tok_s_mean']} | "
-                f"{r['ttft_p50_ms']} | {r['ttft_p90_ms']} | {r['tpot_p50_ms']} | {r['tpot_p90_ms']} | "
-                f"{r['e2el_p50_s']} | {r['successful']}/{r['failed']} |"
+                f"{r['ttft_p50_ms']} | {r.get('ttft_p95_ms', r['ttft_p90_ms'])} | {r['ttft_p99_ms']} | "
+                f"{r['tpot_p50_ms']} | {r.get('tpot_p95_ms', r['tpot_p90_ms'])} | {r['tpot_p99_ms']} | "
+                f"{r.get('itl_p50_ms', r['tpot_p50_ms'])} | {r['e2el_p50_s']} | {r['successful']}/{r['failed']} |"
             )
     lines.append("")
     return "\n".join(lines)
@@ -419,6 +450,12 @@ def main() -> None:
     long_concs = [int(x) for x in args.long_concurrencies.split(",") if x.strip()]
     pref_concs = [int(x) for x in args.prefix_concurrencies.split(",") if x.strip()]
 
+    existing_keys = {
+        (r.get("suite"), r.get("workload"), r.get("concurrency"))
+        for r in all_rows
+        if r.get("successful", 0) > 0
+    }
+
     # Wave 1: Regular Context (1k / 1k, 8k / 1k) across concurrency 1, 4, 8, 16, 32, 64
     if args.wave in ("all", "regular"):
         for workload_tag, in_toks, out_toks in [
@@ -426,7 +463,10 @@ def main() -> None:
             ("8k_1k", 8192, 1024),
         ]:
             for c in reg_concs:
-                n_prompts = max(c, 4)
+                if ("regular_context", workload_tag, c) in existing_keys:
+                    print(f"[kimi-k31-bench] Skipping completed regular_context {workload_tag} c={c}", flush=True)
+                    continue
+                n_prompts = c
                 row = asyncio.run(
                     run_sweep_point(
                         base_url=base_url,
@@ -452,7 +492,10 @@ def main() -> None:
             ("128k_1k", 128000, 1024),
         ]:
             for c in long_concs:
-                n_prompts = max(c, 2)
+                if ("long_context", workload_tag, c) in existing_keys:
+                    print(f"[kimi-k31-bench] Skipping completed long_context {workload_tag} c={c}", flush=True)
+                    continue
+                n_prompts = c
                 row = asyncio.run(
                     run_sweep_point(
                         base_url=base_url,
@@ -474,14 +517,18 @@ def main() -> None:
     if args.wave in ("all", "prefix_caching"):
         for hit_ratio, tag_suffix in [(0.0, "0pct_miss"), (0.8, "80pct_hit"), (0.95, "95pct_hit")]:
             for c in pref_concs:
-                n_prompts = max(c, 4)
+                wtag = f"64k_1k_{tag_suffix}"
+                if ("prefix_caching_64k", wtag, c) in existing_keys:
+                    print(f"[kimi-k31-bench] Skipping completed prefix_caching_64k {wtag} c={c}", flush=True)
+                    continue
+                n_prompts = c
                 row = asyncio.run(
                     run_sweep_point(
                         base_url=base_url,
                         model_id=model_id,
                         builder=builder,
                         suite="prefix_caching_64k",
-                        workload_tag=f"64k_1k_{tag_suffix}",
+                        workload_tag=wtag,
                         input_tokens=65536,
                         output_tokens=1024,
                         concurrency=c,

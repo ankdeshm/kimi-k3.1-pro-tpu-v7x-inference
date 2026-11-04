@@ -17,7 +17,9 @@ export SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-moonshotai/Kimi-K3.1-Pro}"
 export PORT="${PORT:-8000}"
 export MAX_MODEL_LEN="${MAX_MODEL_LEN:-131072}"
 export MAX_NUM_SEQS="${MAX_NUM_SEQS:-64}"
-export MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-1360}"
+# 2720 = 2 * 1360 (hybrid KDA+MLA block_size). Must be >= 1360 + max_num_seqs so
+# --mamba-cache-mode=align can schedule 1360-token aligned prefill chunks alongside active decode sequences.
+export MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-2720}"
 export GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.88}"
 export ENABLE_PREFIX_CACHING="${ENABLE_PREFIX_CACHING:-1}"
 
@@ -100,7 +102,7 @@ exec vllm serve "${MODEL_URI}" \
   --max-num-seqs="${MAX_NUM_SEQS}" \
   --max-num-batched-tokens="${MAX_NUM_BATCHED_TOKENS}" \
   --block-size=256 \
-  --compilation-config='{"compile_sizes":[1,4,8,16,32,64,1360]}' \
+  --compilation-config='{"compile_sizes":[1,16,32,64,1360,2720]}' \
   --reasoning-parser=kimi_k3 \
   --tool-call-parser=kimi_k3 \
   --enable-auto-tool-choice \
