@@ -397,7 +397,7 @@ def main() -> None:
     parser.add_argument("--config-tag", default="tp8-dp4-ep32")
     parser.add_argument(
         "--wave",
-        choices=["all", "regular", "long_context", "prefix_caching"],
+        choices=["all", "regular", "long_context", "regular_and_long", "prefix_caching"],
         default="all",
         help="Which benchmark wave(s) to execute",
     )
@@ -415,6 +415,12 @@ def main() -> None:
         "--prefix-concurrencies",
         default="1,4,8,16",
         help="Comma-separated concurrencies for 64k Prefix Caching",
+    )
+    parser.add_argument(
+        "--max-input-tokens",
+        type=int,
+        default=131072,
+        help="Maximum prompt input tokens to include in the benchmark sweep",
     )
     parser.add_argument(
         "--output-dir",
@@ -456,11 +462,13 @@ def main() -> None:
     }
 
     # Wave 1: Regular Context (1k / 1k, 8k / 1k) across concurrency 1, 4, 8, 16, 32, 64
-    if args.wave in ("all", "regular"):
+    if args.wave in ("all", "regular", "regular_and_long"):
         for workload_tag, in_toks, out_toks in [
             ("1k_1k", 1024, 1024),
             ("8k_1k", 8192, 1024),
         ]:
+            if in_toks > args.max_input_tokens:
+                continue
             for c in reg_concs:
                 if ("regular_context", workload_tag, c) in existing_keys:
                     print(f"[kimi-k31-bench] Skipping completed regular_context {workload_tag} c={c}", flush=True)
@@ -484,12 +492,14 @@ def main() -> None:
                 save_incremental(out_dir, meta, all_rows)
 
     # Wave 2: Long Context (64k / 1k, 64k / 4k, 128k / 1k) across concurrency 1, 2, 4, 8, 16
-    if args.wave in ("all", "long_context"):
+    if args.wave in ("all", "long_context", "regular_and_long"):
         for workload_tag, in_toks, out_toks in [
             ("64k_1k", 65536, 1024),
             ("64k_4k", 65536, 4096),
             ("128k_1k", 128000, 1024),
         ]:
+            if in_toks > args.max_input_tokens:
+                continue
             for c in long_concs:
                 if ("long_context", workload_tag, c) in existing_keys:
                     print(f"[kimi-k31-bench] Skipping completed long_context {workload_tag} c={c}", flush=True)

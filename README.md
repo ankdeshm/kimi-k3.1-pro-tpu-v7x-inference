@@ -202,11 +202,45 @@ python3 benchmarks/run_kimi_k31_matrix.py \
 | **`64k_1k_95pct_hit`** | `4` | `95.0%` | **`93.2%`** (`61,200`) | **`54.37`** | **`3,539.62`** | **`6.48×`** | **`5,446.4`** | `5,446.7` | `68.31` | `68.33` | `75.33` | `4 / 0` |
 | **`64k_1k_95pct_hit`** | `8` | `95.0%` | **`93.2%`** (`61,200`) | **`95.78`** | **`6,235.01`** | **`11.79×`** | **`7,369.1`** | `9,153.8` | `76.26` | `74.72` | `85.38` | `8 / 0` |
 
+### 5.4 Pass 3: `SGLang-TorchTPU` Day-0 (`TP=32, EP=8` + SparseCore DSA) on TPU v7x (`2x2x4`)
+
+> **Hardware**: `1×` TPU v7x `2x2x4` slice (`4` hosts × `4` chips = `16` physical chips = `32` TensorCores, `3,072 GB` HBM3e)  
+> **Runtime**: `SGLang-TorchTPU` (`origin/kimi-k31-pro-tpu`, `attention_backend=pallas_tpu_mla_sparse`, `kv_cache_dtype=fp8_e4m3`, `SGLANG_TPU_DSA_INDEXER_TOKEN_SPLIT=1`, `--xla_tpu_offload_gather_to_sparsecore=true`, two-level Pallas all-reduce, static-FP8 decode GEMVs, one-shot `bs=1` logits gather)  
+> **Raw Data**: [`results/sglang-tp32-ep8/summary.json`](results/sglang-tp32-ep8/summary.json) | [`results/sglang-tp32-ep8/REPORT.md`](results/sglang-tp32-ep8/REPORT.md)
+
+- **`8.76×` Faster Single-Stream Decode Latency**: `1k / 1k` and `8k / 1k` at `c=1` reach **`7.42 ms` – `7.53 ms` TPOT (`134.77` – `132.80` stream `tok/s`)** compared to `65.03 ms` (`15.38` stream `tok/s`) on `vllm-tp8-dp4-ep32` *(note: `1k_1k` `c=1` TTFT includes one-time first-request lazy Pallas kernel compilation; warm `8k_1k` `c=1` TTFT is **`2,336.7 ms`**)*.
+- **`+42.3%` Higher Peak Output Throughput**: `1k / 1k` `c=64` reaches **`866.89` output `tok/s`** (**`1,798.61` total `tok/s`**, `57.63 ms` TPOT P50) vs `609.35` output `tok/s` on `vllm-tp8-dp4-ep32`; `8k / 1k` `c=32` reaches **`350.07` output `tok/s` (`3,176.91` total `tok/s`)**.
+- **`2.17×` Faster Cold `64k` Prefill + `7.74×` Faster `64k` Decode**: With `SGLANG_TPU_DSA_INDEXER_TOKEN_SPLIT=1` and Ironwood SparseCore gather offload, cold `64k / 1k` `c=1` TTFT drops from `30,295.5 ms` to **`13,944.5 ms`** while sustaining **`8.48 ms` TPOT (`117.98` stream `tok/s`)**, scaling to **`3,958.35` total `tok/s`** at `64k / 1k` `c=8` and **`136.02` output `tok/s` (`2,314.80` total `tok/s`)** at `64k / 4k` `c=8`.
+
+| Suite | Workload (`ISL / OSL`) | Concurrency | Output Throughput (`tok/s`) | Total Throughput (`tok/s`) | Stream `tok/s` (Mean) | TTFT P50 (`ms`) | TTFT P95 (`ms`) | TPOT P50 (`ms`) | TPOT P95 (`ms`) | ITL P50 (`ms`) | E2EL P50 (`s`) | OK / Fail |
+| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| `regular_context` | **`1024 / 1024`** | `1` | **`9.22`** *(1st-req JIT)* | **`19.13`** | **`134.77`** | `103,440.9` | `103,440.9` | **`7.42`** | `7.42` | `7.32` | `111.03` | `1 / 0` |
+| `regular_context` | **`1024 / 1024`** | `4` | **`222.46`** | **`461.32`** | `59.89` | `1,525.2` | `1,525.5` | `16.51` | `17.29` | `16.65` | `18.41` | `4 / 0` |
+| `regular_context` | **`1024 / 1024`** | `8` | **`351.17`** | **`728.79`** | `48.89` | `2,301.0` | `3,072.1` | `20.55` | `21.37` | `20.06` | `23.33` | `8 / 0` |
+| `regular_context` | **`1024 / 1024`** | `16` | **`539.56`** | **`1,119.56`** | `37.80` | `3,084.7` | `4,731.5` | `26.66` | `28.29` | `25.36` | `30.36` | `16 / 0` |
+| `regular_context` | **`1024 / 1024`** | `32` | **`725.36`** | **`1,505.22`** | `25.39` | `4,902.6` | `8,165.2` | `39.36` | `42.60` | `36.89` | `45.17` | `32 / 0` |
+| `regular_context` | **`1024 / 1024`** | `64` | **`866.89`** | **`1,798.61`** | `19.26` | `8,333.5` | `14,959.0` | `57.63` | `64.11` | `51.62` | `67.28` | `64 / 0` |
+| `regular_context` | **`8192 / 1024`** | `1` | **`101.99`** | **`925.54`** | **`132.80`** | **`2,336.7`** | `2,336.7` | **`7.53`** | `7.53` | `7.46` | `10.04` | `1 / 0` |
+| `regular_context` | **`8192 / 1024`** | `4` | **`166.74`** | **`1,513.10`** | `52.95` | `5,968.5` | `7,464.0` | `19.83` | `21.49` | `16.85` | `24.56` | `4 / 0` |
+| `regular_context` | **`8192 / 1024`** | `8` | **`234.64`** | **`2,129.16`** | `39.55` | `9,344.4` | `14,249.4` | `26.65` | `31.60` | `20.39` | `34.91` | `8 / 0` |
+| `regular_context` | **`8192 / 1024`** | `16` | **`302.43`** | **`2,744.59`** | `27.43` | `16,129.8` | `26,267.6` | `38.84` | `48.76` | `26.12` | `54.17` | `16 / 0` |
+| `regular_context` | **`8192 / 1024`** | `32` | **`350.07`** | **`3,176.91`** | `16.86` | `29,766.7` | `51,845.3` | `64.05` | `85.63` | `38.13` | `93.60` | `32 / 0` |
+| `regular_context` | **`8192 / 1024`** | `64` | **`345.47`** | **`3,135.07`** | `13.15` | `57,649.6` | `160,192.7` | `96.89` | `143.24` | `53.54` | `154.22` | `64 / 0` |
+| `long_context` | **`65536 / 1024`** | `1` | **`45.28`** | **`2,946.54`** | **`117.98`** | **`13,944.5`** | `13,944.5` | **`8.48`** | `8.48` | `8.44` | `22.62` | `1 / 0` |
+| `long_context` | **`65536 / 1024`** | `2` | **`46.61`** | **`3,033.17`** | `47.94` | `14,195.2` | `27,299.8` | `16.26` | `29.07` | `16.31` | `43.94` | `2 / 0` |
+| `long_context` | **`65536 / 1024`** | `4` | **`56.43`** | **`3,672.44`** | `31.81` | `40,815.0` | `53,916.7` | `44.06` | `57.05` | `18.30` | `72.58` | `4 / 0` |
+| `long_context` | **`65536 / 1024`** | `8` | **`60.83`** | **`3,958.35`** | `18.74` | `67,445.4` | `107,178.0` | `74.87` | `113.85` | `22.96` | `130.72` | `8 / 0` |
+| `long_context` | **`65536 / 1024`** | `16` | **`58.57`** | **`3,811.65`** | `17.81` | `145,017.8` | `224,796.0` | `87.82` | `113.93` | `23.02` | `261.43` | `16 / 0` |
+| `long_context` | **`65536 / 4096`** | `1` | **`84.04`** | **`1,430.35`** | **`117.95`** | `13,989.1` | `13,989.1` | **`8.48`** | `8.48` | `8.45` | `48.74` | `1 / 0` |
+| `long_context` | **`65536 / 4096`** | `2` | **`86.88`** | **`1,478.64`** | `56.14` | `14,212.1` | `27,314.3` | `16.35` | `19.55` | `16.42` | `94.29` | `2 / 0` |
+| `long_context` | **`65536 / 4096`** | `4` | **`126.71`** | **`2,156.43`** | `44.11` | `40,827.6` | `53,915.2` | `24.85` | `28.09` | `18.44` | `129.30` | `4 / 0` |
+| `long_context` | **`65536 / 4096`** | `8` | **`136.02`** | **`2,314.80`** | `41.74` | `67,599.4` | `206,211.6` | `33.70` | `43.43` | `23.86` | `192.28` | `8 / 0` |
+
 ---
 
-## 6. Turnkey Relaunch Scripts for Pass 2 & Pass 3
+## 6. Turnkey Relaunch Scripts for Pass 2, Pass 3 & Pass 4
 
-All configurations, runtime patches, and benchmark automation scripts for **Pass 2 (`vllm-torchtpu` with SGLang-inspired hardware & Pallas optimizations)** and **Pass 3 (`sglang-torchtpu` Day-0 `TP=32, EP=8` + SparseCore DSA)** are pre-staged in [`scripts/`](scripts/) (and backed up on the shared GCS FUSE mount at `/models/kimi_k31_relaunch/`).
+All configurations, runtime patches, and benchmark automation scripts for **Pass 2 (`vllm-torchtpu` with SGLang-inspired hardware & Pallas optimizations)**, **Pass 3 (`sglang-torchtpu` Day-0 `TP=32, EP=8` + SparseCore DSA)**, and **Pass 4 (`sglang-torchtpu` 93-Layer Decode MegaKernel + `RadixArk/Kimi-K3.1-Dflash2-Preview` 8-Token Block Verification)** are pre-staged in [`scripts/`](scripts/).
 
 ### 6.1 Relaunch Pass 2 (`vllm-torchtpu` with SGLang Hardware Optimizations)
 - **Pass 2B (`TP=32, DP=1, EP=32` + `TPU_K3_SP_PREFILL=1` + SparseCore Gather Offload + Fused MoE Decode + MegaKDA DMA Overlap)**:
@@ -220,5 +254,11 @@ All configurations, runtime patches, and benchmark automation scripts for **Pass
 
 ### 6.2 Relaunch Pass 3 (`sglang-torchtpu` Day-0 `TP=32, EP=8` + SparseCore DSA)
 ```bash
-WAVE=all bash scripts/relaunch_pass3_sglang_day0.sh
+MODE=server WAVE=all bash scripts/relaunch_pass3_sglang_day0.sh
 ```
+
+### 6.3 Relaunch Pass 4 (`sglang-torchtpu` 93-Layer Decode MegaKernel + `Kimi-K3.1-Dflash2-Preview`)
+```bash
+MODE=megakernel SPEC_DRAFT_PATH=/models/models/RadixArk/Kimi-K3.1-Dflash2-Preview bash scripts/relaunch_pass3_sglang_day0.sh
+```
+

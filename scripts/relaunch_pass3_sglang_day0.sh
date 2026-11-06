@@ -25,9 +25,13 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MODE="${MODE:-server}"                             # server or megakernel
-CONFIG_TAG="${CONFIG_TAG:-sglang-tp32-ep8}"
+if [[ "${MODE}" == "megakernel" ]]; then
+  CONFIG_TAG="${CONFIG_TAG:-sglang-megakernel-dflash2}"
+else
+  CONFIG_TAG="${CONFIG_TAG:-sglang-tp32-ep8}"
+fi
 MODEL_PATH="${MODEL_PATH:-/models/models/moonshotai/Kimi-K3.1-Pro}"
-SPEC_DRAFT_PATH="${SPEC_DRAFT_PATH:-/models/models/RadixArk/Kimi-K3-DSpark}"
+SPEC_DRAFT_PATH="${SPEC_DRAFT_PATH:-/models/models/RadixArk/Kimi-K3.1-Dflash2-Preview}"
 PORT="${PORT:-30000}"
 WAVE="${WAVE:-all}"
 POD_SELECTOR="${POD_SELECTOR:-}"
@@ -78,8 +82,9 @@ echo "=== [Pass 3] TPU_WORKER_HOSTNAMES=${TPU_HOSTNAMES_CSV}, DIST_INIT_ADDR=${H
 for pod in "${ORDERED_PODS[@]}"; do
   echo "[Pass 3] Preparing SGLang-TorchTPU environment on /dev/shm & syncing configs on ${pod}..."
   kctl exec "${pod}" -- bash -c '
-    mkdir -p /dev/shm/sglang_tmp /dev/shm/tpu_tier3_cache /dev/shm/torchinductor /dev/shm/xdg_cache /dev/shm/hf_cache /dev/shm/workspace/kimi_k31/configs /dev/shm/workspace/kimi_k31/results /models/benchmark-results/kimi_k31
-    rm -rf /workspace/kimi_k31 /workspace/sglang /workspace/sglang_deps
+    mkdir -p /dev/shm/sglang_tmp /dev/shm/tpu_tier3_cache /dev/shm/torchinductor /dev/shm/xdg_cache /dev/shm/hf_cache /dev/shm/root_cache /dev/shm/workspace/kimi_k31/configs /dev/shm/workspace/kimi_k31/results /models/benchmark-results/kimi_k31
+    rm -rf /root/.cache /workspace/kimi_k31 /workspace/sglang /workspace/sglang_deps
+    ln -sfn /dev/shm/root_cache /root/.cache
     mkdir -p /workspace
     ln -sfn /dev/shm/workspace/kimi_k31 /workspace/kimi_k31
     ln -sfn /dev/shm/workspace/sglang /workspace/sglang
@@ -127,7 +132,7 @@ PY
 done
 
 if [[ "${MODE}" == "megakernel" ]]; then
-  echo "[Pass 3] Launching Single-Stream Decode MegaKernel + Speculative Decoding across all 4 pods..."
+  echo "[Pass 4] Launching Single-Stream Decode MegaKernel + Speculative Decoding (${SPEC_DRAFT_PATH}) across all 4 pods..."
   for rank in 0 1 2 3; do
     pod="${ORDERED_PODS[$rank]}"
     kctl exec "${pod}" -- python3 -c "
@@ -142,6 +147,7 @@ env['TPU_WORKER_HOSTNAMES'] = '${TPU_HOSTNAMES_CSV}'
 env['MODEL_PATH'] = '${MODEL_PATH}'
 env['SPEC_DRAFT_PATH'] = '${SPEC_DRAFT_PATH}'
 env['DRAFT_MODEL_PATH'] = '${SPEC_DRAFT_PATH}'
+env['PORT'] = '${PORT}'
 env['TMPDIR'] = '/dev/shm/sglang_tmp'
 env['TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT'] = '/dev/shm/tpu_tier3_cache'
 env['TORCHINDUCTOR_CACHE_DIR'] = '/dev/shm/torchinductor'
@@ -161,7 +167,30 @@ p = subprocess.Popen(
 print('MEGAKERNEL_RANK_${rank}_PID=', p.pid)
 "
   done
-  echo "=== MegaKernel launched on all 4 ranks! Monitor: kubectl exec ${HEAD_POD} -- tail -f /workspace/kimi_k31/sglang_megakernel_rank0.log ==="
+  MK_WAVE="${MK_WAVE:-regular_and_long}"
+  MK_MAX_INPUT="${MK_MAX_INPUT:-65536}"
+  DETACH_BENCH="${DETACH_BENCH:-1}"
+  if [[ "${DETACH_BENCH}" == "1" ]]; then
+    echo "[Pass 4] Spawning detached single-stream benchmark driver on ${HEAD_POD} (logs: /workspace/kimi_k31/pass4_${CONFIG_TAG}_bench.log, durable GCS output: /models/benchmark-results/kimi_k31/${CONFIG_TAG})..."
+    kctl exec "${HEAD_POD}" -- python3 -c "
+import shlex, subprocess
+cmd = [
+    'python3', '-u', '/workspace/kimi_k31/run_kimi_k31_matrix.py',
+    '--port', '${PORT}',
+    '--wave', '${MK_WAVE}',
+    '--regular-concurrencies', '1',
+    '--long-concurrencies', '1',
+    '--max-input-tokens', '${MK_MAX_INPUT}',
+    '--config-tag', '${CONFIG_TAG}',
+    '--tokenizer', '${MODEL_PATH}',
+    '--output-dir', '/models/benchmark-results/kimi_k31',
+] + shlex.split('${EXTRA_BENCH_ARGS:-}')
+log = open('/workspace/kimi_k31/pass4_${CONFIG_TAG}_bench.log', 'w')
+p = subprocess.Popen(cmd, cwd='/workspace/kimi_k31', stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+print('PASS4_BENCH_DRIVER_PID=', p.pid)
+"
+  fi
+  echo "=== MegaKernel + DFlash2 launched on all 4 ranks! Monitor: kubectl exec ${HEAD_POD} -- tail -f /workspace/kimi_k31/sglang_megakernel_rank0.log ==="
   exit 0
 fi
 
