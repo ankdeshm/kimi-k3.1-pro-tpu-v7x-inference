@@ -1,6 +1,17 @@
 # Moonshot AI `Kimi-K3.1-Pro` (`2.8T` / `104B` Active MoE) Inference & Benchmarking on Google Cloud TPU v7x (Ironwood)
 
-Production serving recipes, runtime patches, Kubernetes LeaderWorkerSet (`LWS`) manifests, and comprehensive performance benchmarks for **`moonshotai/Kimi-K3.1-Pro`** (`2.8T` total parameters / `104B` active parameters per token) on **Google Cloud TPU v7x (Ironwood)** using **`vllm-torchtpu`**.
+Production serving recipes, runtime patches, Kubernetes (`LeaderWorkerSet` & `Indexed Job`) manifests, and comprehensive performance benchmarks for **`moonshotai/Kimi-K3.1-Pro`** (`2.8T` total parameters / `104B` active parameters per token) on a single **Google Cloud TPU `v7x-16` (`2x2x4`, `16` physical chips / `32` TensorCores, `3,072 GB` HBM3e)** slice across **`SGLang-TorchTPU`** (including the **93-Layer Pallas Decode MegaKernel + `DFlash2-8`**) and **`vllm-torchtpu`**.
+
+---
+
+## Executive Summary — All 4 Serving Passes on TPU `v7x-16` (`2x2x4`, `16` Chips / `32` TensorCores)
+
+| Pass | Serving Engine & Parallelism | Key Kernel & Cache Stack | `1k/1k` `c=1` Stream TPS (`TPOT`) | Peak `1k/1k` Out TPS (`c=64`) | Cold `128k/1k` `c=1` TTFT (`TPOT`) | `64k/1k` `95%` Prefix Hit Peak Total TPS | Verified Matrix (`OK/Total`) & Artifacts |
+| :--- | :--- | :--- | :---: | :---: | :---: | :---: | :--- |
+| **Pass 4 (`MegaKernel + DFlash2-8`)** | **`SGLang-TorchTPU` (`TP=32, EP=8`)** | **93-Layer Persistent Pallas Decode MegaKernel + `Kimi-K3.1-Dflash2-Preview` (`8` draft tokens)** | **`350.76` (`2.85 ms`)** | *Single-stream mode (`264.03` E2E out @ `c=1`)* | *`64k/4k`: `194.21` stream TPS (`5.15 ms`)* | — | **`4 / 4`** · [Sec. 5.6](#56-pass-4-sglang-torchtpu-93-layer-pallas-decode-megakernel--kimi-k31-dflash2-preview-tp32-ep8--ultra-low-latency-single-stream) · [`REPORT`](results/sglang-megakernel-dflash2/REPORT.md) · [`JSON`](results/sglang-megakernel-dflash2/summary.json) |
+| **Pass 3 (`SGLang Day-0 Server`)** | **`SGLang-TorchTPU` (`TP=32, EP=8`)** | **`pallas_tpu_mla_sparse` (`topk=2048`), SparseCore Gather Offload, `HiRadixCache` + `MambaRadixCache`** | **`134.77` (`7.42 ms`)** | **`866.89` out** (`1,798.6` tot) | **`26.54 s` (`8.84 ms`)** *(up to `c=16` = `2.09M` ctx tok)* | **`24,675.2` tot** (`379.1` out @ `c=16`, `6.83 s` TTFT) | **`39 / 39`** · [Sec. 5.5](#55-pass-3-sglang-torchtpu-day-0-tp32-ep8--sparsecore-dsa-on-tpu-v7x-2x2x4--complete-3939-matrix) · [`REPORT`](results/sglang-tp32-ep8/REPORT.md) · [`JSON`](results/sglang-tp32-ep8/summary.json) |
+| **Pass 2 (`vLLM + SGLang HW Opts`)** | **`vllm-torchtpu` (`TP=32, DP=1, EP=32`)** | **`TPU_K3_SP_PREFILL=1`, Tuned v2 MLA (`bs=256`), SparseCore Gather, Fused MoE Decode, MegaKDA DMA Overlap** | `15.26` (`65.52 ms`) | `564.66` out (`1,173.3` tot) | **`52.37 s`** (`67.86 ms`, up to `c=16` = `2.09M` ctx tok) | **`9,442.9` tot** (`145.1` out @ `c=16`, `14.82 s` TTFT) | **`39 / 39`** · [Sec. 5.4](#54-pass-2-vllm-torchtpu-single-pool-sequence-parallel-prefill-tp32-dp1-ep32--sglang-hw-optimizations--complete-3939-matrix) · [`REPORT`](results/vllm-tp32-ep32-sglang-opt/REPORT.md) · [`JSON`](results/vllm-tp32-ep32-sglang-opt/summary.json) |
+| **Pass 1 (`vLLM DP=4 Baseline`)** | **`vllm-torchtpu` (`TP=8, DP=4, EP=32`)** | **Unified Hybrid KV+KDA Layout (`block_size=1360`, `MNBT=2720`), `--mamba-cache-mode=align`** | `15.38` (`65.03 ms`) | `609.35` out (`1,263.9` tot) | `64.80 s` (`66.14 ms`, up to `c=4`) | `6,235.0` tot (`95.8` out @ `c=8`, `7.37 s` TTFT) | **`32 / 32`** · [Sec. 5.1–5.3](#5-benchmark-matrix--live-tpu-v7x-2x2x4-results) · [`REPORT`](results/vllm-tp8-dp4-ep32/REPORT.md) · [`JSON`](results/vllm-tp8-dp4-ep32/summary.json) |
 
 ---
 
@@ -27,12 +38,13 @@ A TPU v7x `2x2x4` slice consists of `4` `tpu7x-standard-4t` nodes (`16` physical
 
 | Parallelism Topology | Sharding Layout across `32` TensorCores (`2x2x4`) | Weight + XLA HBM per TensorCore | Available Unified KV + KDA State HBM per Core (`gpu_memory_utilization=0.88`) | Total Token Capacity Across Slice (`block_size=1360`, FP8 KV) | Primary Use Case |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Config A: `TP=8, DP=4, EP=32`** | `4` independent `TP=8` DP replicas (`1` per host) + `32`-way Expert Parallelism (`28` routed experts/core) across the `2x2x4` ICI torus | **`68.26 GiB` / `94.74 GiB`** | **`15.11 GiB` / core** (`~492` unified blocks/replica) | **`~669,000` tokens / DP replica** (`~2.67M` tokens across `4` DP replicas) | **High-Throughput Serving** (4× independent attention engines + 8-way intra-host attention All-Reduce) |
-| **Config B: `TP=32, DP=1, EP=32`** | Single `32`-way Tensor Parallel replica + `32`-way Expert Parallelism (`28` routed experts/core) + `TPU_K3_SP_PREFILL=1` sequence-parallel prefill | **`~52.50 GiB` / `94.74 GiB`** | **`~30.87 GiB` / core** (`~1,005` unified blocks) | **`>1,366,000` tokens in a single unified pool** | **Lowest Single-Stream Latency & Ultra-Long Context (`64k–128k+`)** |
+| **Config A (`vllm-torchtpu`): `TP=8, DP=4, EP=32`** | `4` independent `TP=8` DP replicas (`1` per host) + `32`-way Expert Parallelism (`28` routed experts/core) across the `2x2x4` ICI torus | **`68.26 GiB` / `94.74 GiB`** | **`15.11 GiB` / core** (`~492` unified blocks/replica) | **`~669,000` tokens / DP replica** (`~2.67M` tokens across `4` DP replicas) | **Multi-Replica `vllm-torchtpu` Serving** (`4×` independent attention engines) |
+| **Config B (`vllm-torchtpu`): `TP=32, DP=1, EP=32`** | Single `32`-way Tensor Parallel replica + `32`-way Expert Parallelism (`28` routed experts/core) + `TPU_K3_SP_PREFILL=1` sequence-parallel prefill | **`~52.50 GiB` / `94.74 GiB`** | **`~30.87 GiB` / core** (`~1,005` unified blocks) | **`>1,366,000` tokens in a single unified pool** | **Unified Long-Context Pool (`c=16` @ `128k` = `2.09M` active tokens)** |
+| **Config C (`SGLang-TorchTPU`): `TP=32, EP=8`** | `32`-way attention TP + `8`-way routed-expert EP (`112` experts/EP-group × `4`-way expert-TP) + SparseCore DSA (`topk=2048`) + optional 93-Layer MegaKernel | **`~54.0 GiB` / `94.74 GiB`** | **`~29.5 GiB` / core** (`HiRadixCache` + `MambaRadixCache`) | **`>2,100,000` tokens in unified `HiRadixCache`** | **Highest Throughput (`866.9` out / `24,675` tot `tok/s`) & Lowest Latency (`2.85 ms`–`7.42 ms` TPOT)** |
 
 ---
 
-## 2. How `vllm-torchtpu` Executes `moonshotai/Kimi-K3.1-Pro`
+## 2. How `vllm-torchtpu` & `SGLang-TorchTPU` Execute `moonshotai/Kimi-K3.1-Pro`
 
 ### 2.1 Unified Hybrid KV + KDA Recurrent State Cache (`TPU_UNIFIED_KV_CACHE_LAYOUT=1`)
 
@@ -82,7 +94,7 @@ We also include the `SGLang-TorchTPU` (`origin/kimi-k31-pro-tpu`) Day-0 serving 
 
 ```text
 kimi-k3.1-pro-tpu-v7x-inference/
-├── README.md                                               # Architecture, memory math, & benchmark results
+├── README.md                                               # Architecture, memory math, & Passes 1-4 benchmark results
 ├── INFRA_SETUP.md                                          # Step-by-step GKE TPU v7x 2x2x4 & GCS FUSE setup guide
 ├── configs/
 │   ├── kimi-k3.1-pro-tp8-dp4-ep32.sh                       # vllm-torchtpu Config A: TP=8, DP=4, EP=32
@@ -92,12 +104,13 @@ kimi-k3.1-pro-tpu-v7x-inference/
 ├── scripts/
 │   ├── stage_hf_to_gcs.py                                  # Parallel multi-pod HF -> GCS staging & byte verifier
 │   ├── relaunch_pass2_vllm_sglang_opt.sh                   # Turnkey Pass 2 launcher: vllm-torchtpu + SGLang HW optimizations
-│   ├── relaunch_pass3_sglang_day0.sh                       # Turnkey Pass 3 launcher: SGLang-TorchTPU Day-0 (TP=32, EP=8)
+│   ├── relaunch_pass3_sglang_day0.sh                       # Turnkey Pass 3/4 launcher: SGLang-TorchTPU Day-0 & MegaKernel
 │   └── patches/
 │       └── patch_vllm_torchtpu_kimi_k31.py                 # Idempotent vllm + vllm-torchtpu runtime patch
 ├── k8s/
 │   ├── provision_gke_dws_calendar.sh                       # GKE + TPU v7x 2x2x4 node pool provisioning script
-│   └── kimi-k3.1-pro-lws-v7x-16.yaml                       # 4-Pod LeaderWorkerSet manifest for 2x2x4 TPU v7x
+│   ├── kimi-k3.1-pro-lws-v7x-16.yaml                       # 4-Pod LeaderWorkerSet manifest for 2x2x4 TPU v7x (Pass 1)
+│   └── kimi-k3.1-pro-sglang-v7x-16-job.yaml                # 4-Pod Indexed Job + Headless Service for Passes 2, 3 & 4
 ├── benchmarks/
 │   └── run_kimi_k31_matrix.py                              # Async OpenAI streaming benchmark harness (Waves 1-3)
 └── results/

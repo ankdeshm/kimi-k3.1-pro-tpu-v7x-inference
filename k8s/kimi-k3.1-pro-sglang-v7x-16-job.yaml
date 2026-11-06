@@ -1,0 +1,84 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: kimi-k31-v7x16-hl
+  namespace: default
+spec:
+  clusterIP: None
+  selector:
+    app: kimi-k31-v7x16
+  ports:
+    - name: tpu-ici
+      port: 8471
+    - name: http
+      port: 8000
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: kimi-k31-v7x16
+  namespace: default
+spec:
+  backoffLimit: 1
+  completionMode: Indexed
+  completions: 4
+  parallelism: 4
+  template:
+    metadata:
+      annotations:
+        cluster-autoscaler.kubernetes.io/safe-to-evict: "false"
+        gke-gcsfuse/volumes: "true"
+        gke-gcsfuse/cpu-limit: "0"
+        gke-gcsfuse/memory-limit: "0"
+        gke-gcsfuse/ephemeral-storage-limit: "0"
+      labels:
+        app: kimi-k31-v7x16
+    spec:
+      subdomain: kimi-k31-v7x16-hl
+      restartPolicy: Never
+      nodeSelector:
+        cloud.google.com/tpu-v7x-worker-node: tpu7x
+        cloud.google.com/tpu-v7x-worker-node: 2x2x4
+      tolerations:
+        - key: google.com/tpu
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: bench
+          image: us-central1-docker.pkg.dev/YOUR_GCP_PROJECT_ID/vllm/vllm-torchtpu-bench:v0.32.0
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            privileged: true
+          env:
+            - name: TPU_PROCESS_PORT
+              value: "8471"
+            - name: TPU_PROCESS_ADDRESSES
+              value: "kimi-k31-v7x16-0.kimi-k31-v7x16-hl:8471,kimi-k31-v7x16-1.kimi-k31-v7x16-hl:8471,kimi-k31-v7x16-2.kimi-k31-v7x16-hl:8471,kimi-k31-v7x16-3.kimi-k31-v7x16-hl:8471"
+            - name: TPU_WORKER_HOSTNAMES
+              value: "kimi-k31-v7x16-0.kimi-k31-v7x16-hl,kimi-k31-v7x16-1.kimi-k31-v7x16-hl,kimi-k31-v7x16-2.kimi-k31-v7x16-hl,kimi-k31-v7x16-3.kimi-k31-v7x16-hl"
+          command:
+            - /bin/bash
+            - -lc
+            - |
+              ulimit -c 0 || true
+              mkdir -p /dev/shm/hf_cache /dev/shm/vllm_tmp /dev/shm/vllm_cache /dev/shm/torchinductor /workspace/kimi_k31
+              # Run Pass 2 (vllm-torchtpu TP=32/EP=32) or Pass 3/4 (SGLang-TorchTPU TP=32/EP=8 & MegaKernel) via scripts/relaunch_pass*.sh
+              sleep infinity
+          resources:
+            requests:
+              google.com/tpu: "4"
+            limits:
+              google.com/tpu: "4"
+          volumeMounts:
+            - name: models-gcs
+              mountPath: /models
+            - name: dshm
+              mountPath: /dev/shm
+      volumes:
+        - name: models-gcs
+          persistentVolumeClaim:
+            claimName: YOUR_MODELS_GCS_PVC
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 512Gi
