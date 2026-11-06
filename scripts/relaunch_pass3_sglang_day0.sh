@@ -96,6 +96,7 @@ for pod in "${ORDERED_PODS[@]}"; do
   kctl exec "${pod}" -- bash -c '
     python3 -c "import os, signal, pathlib; me={1, os.getpid(), os.getppid()}; [os.kill(int(p.name), 9) for p in pathlib.Path(\"/proc\").iterdir() if p.name.isdigit() and int(p.name) not in me and any(k in p.joinpath(\"cmdline\").read_bytes().decode(\"utf-8\",\"ignore\") for k in (\"vllm serve\", \"vllm.entrypoints\", \"VLLM::Worker\", \"multiprocessing.spawn\", \"sglang\", \"EngineCore\", \"run_kimi_k31_matrix\"))]" 2>/dev/null || true
     ray stop --force 2>/dev/null || true
+    rm -rf /dev/shm/k3mk_* /dev/shm/torch_tpu_pg_store_* 2>/dev/null || true
     sleep 2
     if [[ ! -d /dev/shm/workspace/sglang/python/sglang ]] && [[ -f /models/sglang_kimi_k31.tar.gz ]]; then
       mkdir -p /dev/shm/workspace/sglang
@@ -169,13 +170,15 @@ print('MEGAKERNEL_RANK_${rank}_PID=', p.pid)
   done
   MK_WAVE="${MK_WAVE:-regular_and_long}"
   MK_MAX_INPUT="${MK_MAX_INPUT:-65536}"
+  BENCH_HOST="${BENCH_HOST:-127.0.0.1}"
   DETACH_BENCH="${DETACH_BENCH:-1}"
   if [[ "${DETACH_BENCH}" == "1" ]]; then
-    echo "[Pass 4] Spawning detached single-stream benchmark driver on ${HEAD_POD} (logs: /workspace/kimi_k31/pass4_${CONFIG_TAG}_bench.log, durable GCS output: /models/benchmark-results/kimi_k31/${CONFIG_TAG})..."
+    echo "[Pass 4] Spawning detached single-stream benchmark driver on ${HEAD_POD} -> ${BENCH_HOST}:${PORT} (logs: /workspace/kimi_k31/pass4_${CONFIG_TAG}_bench.log, durable GCS output: /models/benchmark-results/kimi_k31/${CONFIG_TAG})..."
     kctl exec "${HEAD_POD}" -- python3 -c "
 import shlex, subprocess
 cmd = [
     'python3', '-u', '/workspace/kimi_k31/run_kimi_k31_matrix.py',
+    '--host', '${BENCH_HOST}',
     '--port', '${PORT}',
     '--wave', '${MK_WAVE}',
     '--regular-concurrencies', '1',
