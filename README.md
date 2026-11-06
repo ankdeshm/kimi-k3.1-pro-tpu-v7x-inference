@@ -101,8 +101,10 @@ kimi-k3.1-pro-tpu-v7x-inference/
 ├── benchmarks/
 │   └── run_kimi_k31_matrix.py                              # Async OpenAI streaming benchmark harness (Waves 1-3)
 └── results/
-    ├── vllm-tp8-dp4-ep32/                                  # Raw JSON & Markdown benchmark reports (32 rows, Waves 1-3)
-    └── sglang-tp32-ep8/                                    # Raw JSON & Markdown SGLang-TorchTPU Day-0 reports (39 rows, Waves 1-3)
+    ├── vllm-tp8-dp4-ep32/                                  # Pass 1: vllm-torchtpu TP=8, DP=4, EP=32 (32 rows, Waves 1-3)
+    ├── vllm-tp32-ep32-sglang-opt/                          # Pass 2: vllm-torchtpu TP=32, EP=32 + SGLang HW opts (39 rows, Waves 1-3)
+    ├── sglang-tp32-ep8/                                    # Pass 3: SGLang-TorchTPU Day-0 TP=32, EP=8 + SparseCore DSA (39 rows, Waves 1-3)
+    └── sglang-megakernel-dflash2/                          # Pass 4: SGLang-TorchTPU 93-Layer MegaKernel + DFlash2-8 (4 rows, 350.76 tok/s)
 ```
 
 ---
@@ -203,7 +205,61 @@ python3 benchmarks/run_kimi_k31_matrix.py \
 | **`64k_1k_95pct_hit`** | `4` | `95.0%` | **`93.2%`** (`61,200`) | **`54.37`** | **`3,539.62`** | **`6.48×`** | **`5,446.4`** | `5,446.7` | `68.31` | `68.33` | `75.33` | `4 / 0` |
 | **`64k_1k_95pct_hit`** | `8` | `95.0%` | **`93.2%`** (`61,200`) | **`95.78`** | **`6,235.01`** | **`11.79×`** | **`7,369.1`** | `9,153.8` | `76.26` | `74.72` | `85.38` | `8 / 0` |
 
-### 5.4 Pass 3: `SGLang-TorchTPU` Day-0 (`TP=32, EP=8` + SparseCore DSA) on TPU v7x (`2x2x4`) — Complete `39/39` Matrix
+### 5.4 Pass 2: `vllm-torchtpu` Single-Pool Sequence-Parallel Prefill (`TP=32, DP=1, EP=32` + SGLang HW Optimizations) — Complete `39/39` Matrix
+
+> **Hardware**: `1×` TPU v7x `2x2x4` slice (`4` hosts × `4` chips = `16` physical chips = `32` TensorCores, `3,072 GB` HBM3e)  
+> **Runtime**: `vllm-torchtpu` (`TPU_K3_SP_PREFILL=1`, `--block-size=256` tuned v2 MLA Pallas table, `--xla_tpu_offload_gather_to_sparsecore=true`, `FUSED_MOE_DECODE_KERNEL=1`, `KDA_OVERLAP_H0_DMA=1`, `KDA_OVERLAP_HT_DMA=1`, `TPU_GREEDY_TOP_TOKENS=1`)  
+> **Raw Data (`39 / 39` Cells, `0` Failures)**: [`results/vllm-tp32-ep32-sglang-opt/summary.json`](results/vllm-tp32-ep32-sglang-opt/summary.json) | [`results/vllm-tp32-ep32-sglang-opt/REPORT.md`](results/vllm-tp32-ep32-sglang-opt/REPORT.md)
+
+- **Unified `1.36M+` Token Pool Unlocks Full `39 / 39` Long-Context Concurrency (`0` Failures up to `2.09M` Active Context Tokens)**: Unlike `vllm-tp8-dp4-ep32` (`32` cells, capped at `c=4` on `64k / 4k` and `128k / 1k` due to 4-way KV partitioning), `TP=32, DP=1, EP=32` pools all `32` TensorCores (`~30.87 GiB`/core free for unified KV + KDA state) and completes **`64k / 4k` up to `c=16` (`93.91` output `tok/s` / `1,598.23` total `tok/s`)** and **`128k / 1k` up to `c=16` (`2,059.48` total `tok/s`, `16 / 0`)**.
+- **`1.51×`–`2.17×` Faster Cold Single-Stream Prefill TTFT vs `TP=8, DP=4, EP=32`**: Activating `TPU_K3_SP_PREFILL=1` sequence parallelism across all `32` TensorCores plus Ironwood SparseCore gather offload cuts single-stream TTFT from `4,104.6 -> 1,892.9 ms` (**`2.17×` faster**) at `8k / 1k`, `30,295.5 -> 20,074.3 ms` (**`1.51×` faster**) at `64k / 1k`, and `64,795.2 -> 52,371.5 ms` (**`1.24×` faster**) at `128k / 1k`.
+- **`9,442.86` Total `tok/s` & `12.81×`–`12.94×` Faster TTFT at `64k` Prefix Caching (`c=16` Unlocked)**:
+  - **`80%` Hit (`79.8%` observed)**: TTFT P50 drops `20,074.3 -> 5,367.7 ms` (**`3.74×` faster**) at `c=1` and `191,791.3 -> 50,611.2 ms` (**`3.79×` faster**) at `c=16`, reaching **`92.82` output `tok/s` (`6,042.18` total `tok/s`)**.
+  - **`95%` Hit (`94.8%` observed)**: TTFT P50 drops `20,074.3 -> 1,567.4 ms` (**`12.81×` faster**) at `c=1` and `191,791.3 -> 14,816.2 ms` (**`12.94×` faster**) at `c=16`, reaching **`145.06` output `tok/s` (`9,442.86` total `tok/s` — `+51.4%` higher than `vllm-tp8-dp4-ep32`'s `c=8` peak of `6,235.01` total `tok/s`)**.
+
+| Suite | Workload (`ISL / OSL`) | Concurrency | Observed Cache % | Output Throughput (`tok/s`) | Total Throughput (`tok/s`) | Stream `tok/s` (Mean) | TTFT P50 (`ms`) | TTFT P95 (`ms`) | TPOT P50 (`ms`) | TPOT P95 (`ms`) | ITL P50 (`ms`) | E2EL P50 (`s`) | OK / Fail |
+| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| `regular_context` | **`1024 / 1024`** | `1` | `0.0%` | **`15.02`** | **`31.21`** | `15.26` | `1,149.7` | `1,149.7` | `65.52` | `65.52` | `65.28` | `68.18` | `1 / 0` |
+| `regular_context` | **`1024 / 1024`** | `4` | `0.0%` | **`56.72`** | **`117.80`** | `14.43` | `1,400.6` | `1,568.1` | `69.16` | `69.92` | `69.03` | `72.15` | `4 / 0` |
+| `regular_context` | **`1024 / 1024`** | `8` | `0.0%` | **`108.80`** | **`226.04`** | `13.92` | `1,974.3` | `2,143.5` | `71.60` | `72.85` | `71.66` | `75.22` | `8 / 0` |
+| `regular_context` | **`1024 / 1024`** | `16` | `0.0%` | **`199.58`** | **`414.61`** | `12.93` | `2,979.2` | `3,778.2` | `77.53` | `78.36` | `76.63` | `81.89` | `16 / 0` |
+| `regular_context` | **`1024 / 1024`** | `32` | `0.0%` | **`345.29`** | **`717.57`** | `11.37` | `4,628.7` | `7,135.2` | `88.21` | `90.24` | `86.31` | `94.46` | `32 / 0` |
+| `regular_context` | **`1024 / 1024`** | `64` | `0.0%` | **`564.66`** | **`1,173.31`** | `9.57` | `8,193.1` | `14,208.4` | `104.85` | `109.58` | `100.21` | `115.04` | `64 / 0` |
+| `regular_context` | **`8192 / 1024`** | `1` | `0.0%` | **`14.88`** | **`135.06`** | `15.29` | **`1,892.9`** | `1,892.9` | `65.42` | `65.42` | `65.43` | `68.82` | `1 / 0` |
+| `regular_context` | **`8192 / 1024`** | `4` | `0.0%` | **`52.03`** | **`472.32`** | `13.97` | `6,077.3` | `7,657.8` | `72.17` | `74.02` | `69.51` | `78.47` | `4 / 0` |
+| `regular_context` | **`8192 / 1024`** | `8` | `0.0%` | **`92.28`** | **`837.81`** | `12.98` | `9,901.6` | `15,022.3` | `77.83` | `82.93` | `72.19` | `88.09` | `8 / 0` |
+| `regular_context` | **`8192 / 1024`** | `16` | `0.0%` | **`149.65`** | **`1,358.59`** | `11.30` | `17,567.6` | `28,546.1` | `90.06` | `99.27` | `77.86` | `107.81` | `16 / 0` |
+| `regular_context` | **`8192 / 1024`** | `32` | `0.0%` | **`218.43`** | **`1,982.86`** | `9.10` | `32,406.7` | `57,183.9` | `112.64` | `132.94` | `88.56` | `146.22` | `32 / 0` |
+| `regular_context` | **`8192 / 1024`** | `64` | `0.0%` | **`290.54`** | **`2,637.41`** | `6.87` | `62,738.0` | `116,051.4` | `152.25` | `194.30` | `104.96` | `217.11` | `64 / 0` |
+| `long_context` | **`65536 / 1024`** | `1` | `0.0%` | **`11.61`** | **`755.56`** | `15.02` | **`20,074.3`** | `20,074.3` | `66.59` | `66.59` | `66.59` | `88.20` | `1 / 0` |
+| `long_context` | **`65536 / 1024`** | `2` | `0.0%` | **`18.08`** | **`1,176.57`** | `12.74` | `20,433.3` | `41,445.8` | `70.22` | `88.93` | `70.31` | `111.41` | `2 / 0` |
+| `long_context` | **`65536 / 1024`** | `4` | `0.0%` | **`26.01`** | **`1,692.88`** | `10.50` | `63,163.3` | `84,257.0` | `109.13` | `128.25` | `71.72` | `155.59` | `4 / 0` |
+| `long_context` | **`65536 / 1024`** | `8` | `0.0%` | **`33.08`** | **`2,152.61`** | `7.82` | `105,945.3` | `169,999.5` | `151.59` | `208.37` | `76.69` | `241.86` | `8 / 0` |
+| `long_context` | **`65536 / 1024`** | `16` | `0.0%` | **`38.28`** | **`2,490.98`** | `5.35` | `191,791.3` | `321,713.0` | `235.89` | `348.11` | `86.86` | `414.00` | `16 / 0` |
+| `long_context` | **`65536 / 4096`** | `1` | `0.0%` | **`13.99`** | **`238.03`** | `15.01` | `20,076.3` | `20,076.3` | `66.62` | `66.62` | `66.62` | `292.88` | `1 / 0` |
+| `long_context` | **`65536 / 4096`** | `2` | `0.0%` | **`24.85`** | **`422.99`** | `14.70` | `20,436.8` | `41,449.5` | `65.87` | `70.37` | `70.39` | `327.74` | `2 / 0` |
+| `long_context` | **`65536 / 4096`** | `4` | `0.0%` | **`43.31`** | **`737.04`** | `12.74` | `63,148.7` | `84,238.5` | `81.20` | `85.98` | `71.87` | `376.46` | `4 / 0` |
+| `long_context` | **`65536 / 4096`** | `8` | `0.0%` | **`67.60`** | **`1,150.51`** | `10.91` | `105,954.5` | `170,003.3` | `95.76` | `109.94` | `77.07` | `478.93` | `8 / 0` |
+| `long_context` | **`65536 / 4096`** | `16` | `0.0%` | **`93.91`** | **`1,598.23`** | `8.50` | `191,811.5` | `321,711.1` | `124.80` | `152.79` | `87.64` | `683.78` | `16 / 0` |
+| `long_context` | **`131072 / 1024`** | `1` | `0.0%` | **`8.41`** | **`1,060.05`** | `14.74` | **`52,371.5`** | `52,371.5` | `67.86` | `67.86` | `67.86` | `121.79` | `1 / 0` |
+| `long_context` | **`131072 / 1024`** | `2` | `0.0%` | **`11.26`** | **`1,420.23`** | `10.97` | `52,741.1` | `107,547.5` | `72.59` | `122.59` | `72.87` | `178.15` | `2 / 0` |
+| `long_context` | **`131072 / 1024`** | `4` | `0.0%` | **`13.95`** | **`1,758.73`** | `7.96` | `163,290.9` | `218,061.6` | `174.07` | `223.99` | `74.19` | `289.96` | `4 / 0` |
+| `long_context` | **`131072 / 1024`** | `8` | `0.0%` | **`15.72`** | **`1,982.45`** | `5.21` | `273,557.5` | `439,564.6` | `280.19` | `429.67` | `81.59` | `509.33` | `8 / 0` |
+| `long_context` | **`131072 / 1024`** | `16` | `0.0%` | **`16.33`** | **`2,059.48`** | `3.39` | `495,586.5` | `866,215.1` | `489.61` | `685.32` | `93.26` | `945.22` | `16 / 0` |
+| `prefix_caching_64k` | **`64k_1k_0pct_miss`** | `1` | `0.0%` | **`11.61`** | **`755.56`** | `15.02` | `20,074.3` | `20,074.3` | `66.59` | `66.59` | `66.59` | `88.20` | `1 / 0` |
+| `prefix_caching_64k` | **`64k_1k_0pct_miss`** | `4` | `0.0%` | **`26.01`** | **`1,692.88`** | `10.50` | `63,163.3` | `84,257.0` | `109.13` | `128.25` | `71.72` | `155.59` | `4 / 0` |
+| `prefix_caching_64k` | **`64k_1k_0pct_miss`** | `8` | `0.0%` | **`33.08`** | **`2,152.61`** | `7.82` | `105,945.3` | `169,999.5` | `151.59` | `208.37` | `76.69` | `241.86` | `8 / 0` |
+| `prefix_caching_64k` | **`64k_1k_0pct_miss`** | `16` | `0.0%` | **`38.28`** | **`2,490.98`** | `5.35` | `191,791.3` | `321,713.0` | `235.89` | `348.11` | `86.86` | `414.00` | `16 / 0` |
+| `prefix_caching_64k` | **`64k_1k_80pct_hit`** | `1` | **`79.8%`** | **`13.93`** | **`907.10`** | `15.02` | **`5,367.7`** | `5,367.7` | `66.59` | `66.59` | `66.60` | `73.49` | `1 / 0` |
+| `prefix_caching_64k` | **`64k_1k_80pct_hit`** | `4` | **`79.8%`** | **`42.92`** | **`2,793.76`** | `12.77` | **`17,122.4`** | `21,938.0` | `80.65` | `85.96` | `71.90` | `95.04` | `4 / 0` |
+| `prefix_caching_64k` | **`64k_1k_80pct_hit`** | `8` | **`79.8%`** | **`66.94`** | **`4,357.58`** | `10.88` | **`28,907.3`** | `43,770.2` | `95.62` | `110.67` | `77.01` | `121.26` | `8 / 0` |
+| `prefix_caching_64k` | **`64k_1k_80pct_hit`** | `16` | **`79.8%`** | **`92.82`** | **`6,042.18`** | `8.44` | **`50,611.2`** | `83,313.1` | `125.61` | `154.70` | `87.31` | `173.67` | `16 / 0` |
+| `prefix_caching_64k` | **`64k_1k_95pct_hit`** | `1` | **`94.8%`** | **`14.69`** | **`956.50`** | `15.02` | **`1,567.4`** | `1,567.4` | `66.59` | `66.59` | `66.60` | `69.69` | `1 / 0` |
+| `prefix_caching_64k` | **`64k_1k_95pct_hit`** | `4` | **`94.8%`** | **`51.43`** | **`3,347.93`** | `13.69` | **`5,590.9`** | `6,110.8` | `73.19` | `75.03` | `71.91` | `79.51` | `4 / 0` |
+| `prefix_caching_64k` | **`64k_1k_95pct_hit`** | `8` | **`94.8%`** | **`90.52`** | **`5,892.55`** | `12.45` | **`8,656.4`** | `11,806.4` | `80.66` | `85.26` | `77.00` | `90.21` | `8 / 0` |
+| `prefix_caching_64k` | **`64k_1k_95pct_hit`** | `16` | **`94.8%`** | **`145.06`** | **`9,442.86`** | `10.45` | **`14,816.2`** | `23,043.4` | `97.06` | `104.41` | `87.57` | `112.22` | `16 / 0` |
+
+### 5.5 Pass 3: `SGLang-TorchTPU` Day-0 (`TP=32, EP=8` + SparseCore DSA) on TPU v7x (`2x2x4`) — Complete `39/39` Matrix
 
 > **Hardware**: `1×` TPU v7x `2x2x4` slice (`4` hosts × `4` chips = `16` physical chips = `32` TensorCores, `3,072 GB` HBM3e)  
 > **Runtime**: `SGLang-TorchTPU` (`origin/kimi-k31-pro-tpu`, `attention_backend=pallas_tpu_mla_sparse`, `kv_cache_dtype=fp8_e4m3`, `SGLANG_TPU_DSA_INDEXER_TOKEN_SPLIT=1`, `--xla_tpu_offload_gather_to_sparsecore=true`, two-level Pallas all-reduce, static-FP8 decode GEMVs, one-shot `bs=1` logits gather)  
@@ -260,7 +316,7 @@ python3 benchmarks/run_kimi_k31_matrix.py \
 | `prefix_caching_64k` | **`64k_1k_95pct_hit`** | `8` | **`94.6%`** | **`272.48`** | **`17,736.74`** | `40.05` | **`4,924.8`** | `6,595.6` | `25.39` | `27.87` | `22.95` | `30.06` | `8 / 0` |
 | `prefix_caching_64k` | **`64k_1k_95pct_hit`** | `16` | **`94.7%`** | **`379.06`** | **`24,675.22`** | `28.30` | **`6,831.8`** | `11,051.5` | `35.57` | `40.53` | `30.86` | `43.21` | `16 / 0` |
 
-### 5.5 Pass 4: `SGLang-TorchTPU` 93-Layer Pallas Decode MegaKernel + `Kimi-K3.1-Dflash2-Preview` (`TP=32, EP=8`) — Ultra-Low-Latency Single-Stream
+### 5.6 Pass 4: `SGLang-TorchTPU` 93-Layer Pallas Decode MegaKernel + `Kimi-K3.1-Dflash2-Preview` (`TP=32, EP=8`) — Ultra-Low-Latency Single-Stream
 
 > **Hardware**: `1×` TPU v7x `2x2x4` slice (`4` hosts × `4` chips = `16` physical chips = `32` TensorCores, `3,072 GB` HBM3e)  
 > **Runtime**: `SGLang-TorchTPU` (`SGLANG_TPU_ENABLE_K3_DECODE_MEGAKERNEL=1`, `SGLANG_TPU_OPT_K3_MEGAKERNEL_RELAX=dense_fp8,pair_oproj,bf16_transport`, `SGLANG_TPU_K3_MEGAKERNEL_PREFILL_BLOCK=16`, `speculative_algorithm=DFLASH`, `speculative_num_draft_tokens=8` with `RadixArk/Kimi-K3.1-Dflash2-Preview`)  
