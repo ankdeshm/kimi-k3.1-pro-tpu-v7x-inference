@@ -260,6 +260,22 @@ python3 benchmarks/run_kimi_k31_matrix.py \
 | `prefix_caching_64k` | **`64k_1k_95pct_hit`** | `8` | **`94.6%`** | **`272.48`** | **`17,736.74`** | `40.05` | **`4,924.8`** | `6,595.6` | `25.39` | `27.87` | `22.95` | `30.06` | `8 / 0` |
 | `prefix_caching_64k` | **`64k_1k_95pct_hit`** | `16` | **`94.7%`** | **`379.06`** | **`24,675.22`** | `28.30` | **`6,831.8`** | `11,051.5` | `35.57` | `40.53` | `30.86` | `43.21` | `16 / 0` |
 
+### 5.5 Pass 4: `SGLang-TorchTPU` 93-Layer Pallas Decode MegaKernel + `Kimi-K3.1-Dflash2-Preview` (`TP=32, EP=8`) — Ultra-Low-Latency Single-Stream
+
+> **Hardware**: `1×` TPU v7x `2x2x4` slice (`4` hosts × `4` chips = `16` physical chips = `32` TensorCores, `3,072 GB` HBM3e)  
+> **Runtime**: `SGLang-TorchTPU` (`SGLANG_TPU_ENABLE_K3_DECODE_MEGAKERNEL=1`, `SGLANG_TPU_OPT_K3_MEGAKERNEL_RELAX=dense_fp8,pair_oproj,bf16_transport`, `SGLANG_TPU_K3_MEGAKERNEL_PREFILL_BLOCK=16`, `speculative_algorithm=DFLASH`, `speculative_num_draft_tokens=8` with `RadixArk/Kimi-K3.1-Dflash2-Preview`)  
+> **Raw Data (`4 / 4` Cells, `0` Failures)**: [`results/sglang-megakernel-dflash2/summary.json`](results/sglang-megakernel-dflash2/summary.json) | [`results/sglang-megakernel-dflash2/REPORT.md`](results/sglang-megakernel-dflash2/REPORT.md)
+
+- **`350.76` Single-Stream Decode `tok/s` (`2.85 ms` TPOT — `22.8×` Faster than Baseline `vllm-tp8-dp4-ep32` & `2.60×` Faster than Standard `SGLang-TorchTPU`!)**: Fusing all `93` hybrid KDA + Gated MLA + MoE layers into a persistent Pallas MegaKernel and pairing it with `8`-token `DFlash2` block verification drives single-stream decode latency down to **`2.85 ms` TPOT (`264.03` end-to-end output `tok/s` including `961.2 ms` TTFT, `3.88 s` total E2EL for `1,024` output tokens)**.
+- **Sub-`5.3 ms` TPOT at `64k` Long Context (`189.68`–`194.21` Stream `tok/s`)**: Sustains **`311.03` stream `tok/s` (`3.22 ms` TPOT)** at `8k / 1k` and **`194.21` stream `tok/s` (`5.15 ms` TPOT)** at `64k / 4k` (`90.89 s` total E2EL for `65,536` prompt + `4,096` generated tokens on a `2.8T`-parameter model).
+
+| Suite | Workload (`ISL / OSL`) | Concurrency | Output Throughput (`tok/s`) | Total Throughput (`tok/s`) | Stream `tok/s` (Mean) | TTFT P50 (`ms`) | TPOT P50 (`ms`) | TPOT P95 (`ms`) | ITL P50 (`ms`) | E2EL P50 (`s`) | OK / Fail |
+| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| `regular_context` | **`1024 / 1024`** | `1` | **`264.03`** | **`547.66`** | **`350.76`** | **`961.2`** | **`2.85`** | `2.85` | `8.66` | **`3.88`** | `1 / 0` |
+| `regular_context` | **`8192 / 1024`** | `1` | **`100.01`** | **`907.44`** | **`311.03`** | `6,949.2` | **`3.22`** | `3.22` | `9.34` | **`10.24`** | `1 / 0` |
+| `long_context` | **`65536 / 1024`** | `1` | **`13.62`** | **`886.28`** | **`189.68`** | `69,791.6` | **`5.27`** | `5.27` | `13.79` | `75.19` | `1 / 0` |
+| `long_context` | **`65536 / 4096`** | `1` | **`45.06`** | **`766.95`** | **`194.21`** | `69,804.6` | **`5.15`** | `5.15` | `13.91` | `90.89` | `1 / 0` |
+
 ---
 
 ## 6. Turnkey Relaunch Scripts for Pass 2, Pass 3 & Pass 4

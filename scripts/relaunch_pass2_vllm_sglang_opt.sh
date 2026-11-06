@@ -73,7 +73,7 @@ for pod in "${ORDERED_PODS[@]}"; do
     python3 -c "import os, signal, pathlib; me={1, os.getpid(), os.getppid()}; [os.kill(int(p.name), 9) for p in pathlib.Path(\"/proc\").iterdir() if p.name.isdigit() and int(p.name) not in me and any(k in p.joinpath(\"cmdline\").read_bytes().decode(\"utf-8\",\"ignore\") for k in (\"vllm serve\", \"vllm.entrypoints\", \"sglang\", \"EngineCore\", \"VLLM::EngineCore\", \"VLLM::Worker\", \"multiprocessing.spawn\", \"multiprocessing.resource_tracker\"))]" 2>/dev/null || true
     sleep 4
     pgrep -f raylet >/dev/null 2>&1 && ray stop --force 2>/dev/null || true
-    rm -rf /tmp/ray /dev/shm/vllm_cache /dev/shm/torchinductor
+    rm -rf /tmp/ray /dev/shm/vllm_cache /dev/shm/torchinductor /dev/shm/k3mk_* /dev/shm/torch_tpu_pg_store_* /dev/shm/workspace 2>/dev/null || true
     mkdir -p /dev/shm/hf_cache /dev/shm/vllm_tmp /dev/shm/vllm_cache /dev/shm/torchinductor
     if [[ -f /models/patches/vllm_torchtpu_v0.32.0/kernels/sparse_core/core_map_helper.py ]]; then
       cp -f /models/patches/vllm_torchtpu_v0.32.0/kernels/sparse_core/core_map_helper.py /workspace/vllm-torchtpu/src/vllm_torchtpu/kernels/sparse_core/core_map_helper.py
@@ -105,9 +105,41 @@ p = subprocess.Popen(
     stderr=subprocess.STDOUT,
     start_new_session=True,
 )
+log.close()
 print('NODE_RANK=${idx} VLLM_PID=', p.pid)
 "
 done
+
+EXTRA_BENCH_ARGS="${EXTRA_BENCH_ARGS:-}"
+DETACH_BENCH="${DETACH_BENCH:-0}"
+DURABLE_OUT_DIR="${DURABLE_OUT_DIR:-/models/benchmark-results/kimi_k31}"
+
+if [[ "${DETACH_BENCH}" == "1" ]]; then
+  echo "[Pass 2] Spawning detached benchmark driver on ${HEAD_POD} (logs: /workspace/kimi_k31/pass2_${CONFIG_TAG}_bench.log, durable output: ${DURABLE_OUT_DIR}/${CONFIG_TAG})..."
+  "${KCTL[@]}" exec "${HEAD_POD}" -- python3 -c "
+import shlex, subprocess
+cmd = [
+    'python3', '-u', '/workspace/kimi_k31/run_kimi_k31_matrix.py',
+    '--host', '127.0.0.1',
+    '--port', '8000',
+    '--wave', '${WAVE}',
+    '--config-tag', '${CONFIG_TAG}',
+    '--tokenizer', '${TOKENIZER_DIR}',
+    '--output-dir', '${DURABLE_OUT_DIR}',
+] + shlex.split('''${EXTRA_BENCH_ARGS}''')
+log = open('/workspace/kimi_k31/pass2_${CONFIG_TAG}_bench.log', 'w')
+p = subprocess.Popen(
+    cmd,
+    stdin=subprocess.DEVNULL,
+    stdout=log,
+    stderr=subprocess.STDOUT,
+    start_new_session=True,
+)
+log.close()
+print('BENCH_DRIVER_PID=', p.pid)
+"
+  exit 0
+fi
 
 # 3. Wait for /health on Worker 0 (fail early if vllm serve exits!) and launch benchmark matrix
 echo "[Pass 2] Waiting for vLLM /health on ${HEAD_POD}:8000 (logs: /workspace/kimi_k31/vllm_${CONFIG_TAG}_rank0.log)..."
@@ -128,16 +160,15 @@ echo "[Pass 2] Waiting for vLLM /health on ${HEAD_POD}:8000 (logs: /workspace/ki
   exit 1
 "
 
-EXTRA_BENCH_ARGS="${EXTRA_BENCH_ARGS:-}"
 echo "[Pass 2] Running benchmark matrix (--wave ${WAVE} --config-tag ${CONFIG_TAG} ${EXTRA_BENCH_ARGS})..."
 "${KCTL[@]}" exec "${HEAD_POD}" -- python3 -u /workspace/kimi_k31/run_kimi_k31_matrix.py \
   --wave "${WAVE}" \
   --config-tag "${CONFIG_TAG}" \
   --tokenizer "${TOKENIZER_DIR}" \
-  --output-dir /workspace/kimi_k31/results \
+  --output-dir "${DURABLE_OUT_DIR}" \
   ${EXTRA_BENCH_ARGS}
 
 mkdir -p "${REPO_ROOT}/results/${CONFIG_TAG}"
-"${KCTL[@]}" cp "${HEAD_POD}:/workspace/kimi_k31/results/${CONFIG_TAG}/summary.json" "${REPO_ROOT}/results/${CONFIG_TAG}/summary.json"
-"${KCTL[@]}" cp "${HEAD_POD}:/workspace/kimi_k31/results/${CONFIG_TAG}/REPORT.md" "${REPO_ROOT}/results/${CONFIG_TAG}/REPORT.md"
+"${KCTL[@]}" cp "${HEAD_POD}:${DURABLE_OUT_DIR}/${CONFIG_TAG}/summary.json" "${REPO_ROOT}/results/${CONFIG_TAG}/summary.json"
+"${KCTL[@]}" cp "${HEAD_POD}:${DURABLE_OUT_DIR}/${CONFIG_TAG}/REPORT.md" "${REPO_ROOT}/results/${CONFIG_TAG}/REPORT.md"
 echo "=== [Pass 2 Complete] Results saved to ${REPO_ROOT}/results/${CONFIG_TAG}/ ==="
