@@ -81,6 +81,11 @@ CONFIG = {
     },
     "runtime_env": {
         "SGLANG_PLATFORM": "tpu",
+        "TMPDIR": "/dev/shm/sglang_tmp",
+        "TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT": "/dev/shm/tpu_tier3_cache",
+        "TORCHINDUCTOR_CACHE_DIR": "/dev/shm/torchinductor",
+        "XDG_CACHE_HOME": "/dev/shm/xdg_cache",
+        "HF_HOME": "/dev/shm/hf_cache",
         "HF_HUB_OFFLINE": "0",
         "TRANSFORMERS_OFFLINE": "0",
         "TORCH_LOGS": "+recompiles",

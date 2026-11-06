@@ -74,27 +74,35 @@ TPU_HOSTNAMES_CSV=$(IFS=,; echo "${POD_IPS[*]}")
 echo "=== [Pass 3] Physical 2x2x4 Torus Pod Order (NODE_RANK 0..3): ${ORDERED_PODS[*]} ==="
 echo "=== [Pass 3] TPU_WORKER_HOSTNAMES=${TPU_HOSTNAMES_CSV}, DIST_INIT_ADDR=${HEAD_IP}:10011, MODE=${MODE} ==="
 
-# 1. Ensure SGLang-TorchTPU (origin/kimi-k31-pro-tpu) and dependencies are staged on all 4 pods
+# 1. Ensure SGLang-TorchTPU (origin/kimi-k31-pro-tpu) and dependencies are staged on /dev/shm across all 4 pods
 for pod in "${ORDERED_PODS[@]}"; do
-  echo "[Pass 3] Preparing SGLang-TorchTPU environment & syncing configs on ${pod}..."
-  kctl exec "${pod}" -- mkdir -p /workspace/kimi_k31/configs /workspace/kimi_k31/results
-  kctl cp "${REPO_ROOT}/configs/sglang-torchtpu-kimi-k3.1-pro-tp32-ep8.py" "${pod}:/workspace/kimi_k31/configs/sglang-torchtpu-kimi-k3.1-pro-tp32-ep8.py"
-  kctl cp "${REPO_ROOT}/configs/sglang-torchtpu-kimi-k3.1-pro-megakernel.sh" "${pod}:/workspace/kimi_k31/configs/sglang-torchtpu-kimi-k3.1-pro-megakernel.sh"
-  kctl cp "${REPO_ROOT}/benchmarks/run_kimi_k31_matrix.py" "${pod}:/workspace/kimi_k31/run_kimi_k31_matrix.py"
+  echo "[Pass 3] Preparing SGLang-TorchTPU environment on /dev/shm & syncing configs on ${pod}..."
+  kctl exec "${pod}" -- bash -c '
+    mkdir -p /dev/shm/sglang_tmp /dev/shm/tpu_tier3_cache /dev/shm/torchinductor /dev/shm/xdg_cache /dev/shm/hf_cache /dev/shm/workspace/kimi_k31/configs /dev/shm/workspace/kimi_k31/results /models/benchmark-results/kimi_k31
+    rm -rf /workspace/kimi_k31 /workspace/sglang /workspace/sglang_deps
+    mkdir -p /workspace
+    ln -sfn /dev/shm/workspace/kimi_k31 /workspace/kimi_k31
+    ln -sfn /dev/shm/workspace/sglang /workspace/sglang
+    ln -sfn /dev/shm/workspace/sglang_deps /workspace/sglang_deps
+  '
+  kctl cp "${REPO_ROOT}/configs/sglang-torchtpu-kimi-k3.1-pro-tp32-ep8.py" "${pod}:/dev/shm/workspace/kimi_k31/configs/sglang-torchtpu-kimi-k3.1-pro-tp32-ep8.py"
+  kctl cp "${REPO_ROOT}/configs/sglang-torchtpu-kimi-k3.1-pro-megakernel.sh" "${pod}:/dev/shm/workspace/kimi_k31/configs/sglang-torchtpu-kimi-k3.1-pro-megakernel.sh"
+  kctl cp "${REPO_ROOT}/benchmarks/run_kimi_k31_matrix.py" "${pod}:/dev/shm/workspace/kimi_k31/run_kimi_k31_matrix.py"
   kctl exec "${pod}" -- bash -c '
     python3 -c "import os, signal, pathlib; me={1, os.getpid(), os.getppid()}; [os.kill(int(p.name), 9) for p in pathlib.Path(\"/proc\").iterdir() if p.name.isdigit() and int(p.name) not in me and any(k in p.joinpath(\"cmdline\").read_bytes().decode(\"utf-8\",\"ignore\") for k in (\"vllm serve\", \"vllm.entrypoints\", \"VLLM::Worker\", \"multiprocessing.spawn\", \"sglang\", \"EngineCore\", \"run_kimi_k31_matrix\"))]" 2>/dev/null || true
     ray stop --force 2>/dev/null || true
-    sleep 3
-    if [[ ! -d /workspace/sglang/python/sglang ]] && [[ -f /models/sglang_kimi_k31.tar.gz ]]; then
-      mkdir -p /workspace/sglang
-      tar -xzf /models/sglang_kimi_k31.tar.gz -C /workspace/sglang
+    sleep 2
+    if [[ ! -d /dev/shm/workspace/sglang/python/sglang ]] && [[ -f /models/sglang_kimi_k31.tar.gz ]]; then
+      mkdir -p /dev/shm/workspace/sglang
+      tar -xzf /models/sglang_kimi_k31.tar.gz -C /dev/shm/workspace/sglang
     fi
-    if [[ ! -d /workspace/sglang_deps ]] && [[ -f /models/sglang_extra_site_packages.tar.gz ]]; then
-      mkdir -p /workspace/sglang_deps
-      tar -xzf /models/sglang_extra_site_packages.tar.gz -C /workspace/sglang_deps
+    if [[ ! -d /dev/shm/workspace/sglang_deps/yaml ]] && [[ -f /models/sglang_extra_site_packages.tar.gz ]]; then
+      mkdir -p /dev/shm/workspace/sglang_deps
+      tar -xzf /models/sglang_extra_site_packages.tar.gz -C /dev/shm/workspace/sglang_deps
     fi
     if [[ -d /models/sglang_extra_deps_v2 ]]; then
-      cp -rf /models/sglang_extra_deps_v2/* /workspace/sglang_deps/
+      mkdir -p /dev/shm/workspace/sglang_deps
+      cp -rf /models/sglang_extra_deps_v2/* /dev/shm/workspace/sglang_deps/
     fi
     python3 - << "PY"
 import pathlib
@@ -105,7 +113,7 @@ subs = [
     ("pltpu.DeviceIdType", "pl.DeviceIdType"),
     ("pltpu.semaphore(", "pl.semaphore("),
 ]
-for fp in pathlib.Path("/workspace/sglang/sglang_tpu").rglob("*.py"):
+for fp in pathlib.Path("/dev/shm/workspace/sglang/sglang_tpu").rglob("*.py"):
     orig = fp.read_text(encoding="utf-8", errors="replace")
     updated = orig
     for old, new in subs:
@@ -133,6 +141,12 @@ env['TPU_WORKER_ID'] = '${rank}'
 env['TPU_WORKER_HOSTNAMES'] = '${TPU_HOSTNAMES_CSV}'
 env['MODEL_PATH'] = '${MODEL_PATH}'
 env['SPEC_DRAFT_PATH'] = '${SPEC_DRAFT_PATH}'
+env['DRAFT_MODEL_PATH'] = '${SPEC_DRAFT_PATH}'
+env['TMPDIR'] = '/dev/shm/sglang_tmp'
+env['TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT'] = '/dev/shm/tpu_tier3_cache'
+env['TORCHINDUCTOR_CACHE_DIR'] = '/dev/shm/torchinductor'
+env['XDG_CACHE_HOME'] = '/dev/shm/xdg_cache'
+env['HF_HOME'] = '/dev/shm/hf_cache'
 env['PYTHONPATH'] = '/workspace/sglang/python:/workspace/sglang:/workspace/sglang_deps'
 log = open('/workspace/kimi_k31/sglang_megakernel_rank${rank}.log', 'w')
 p = subprocess.Popen(
@@ -177,6 +191,11 @@ env['TPU_WORKER_HOSTNAMES'] = '${TPU_HOSTNAMES_CSV}'
 env['MODEL_PATH'] = '${MODEL_PATH}'
 env['PORT'] = '${PORT}'
 env['HEALTH_TIMEOUT'] = '7200'
+env['TMPDIR'] = '/dev/shm/sglang_tmp'
+env['TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT'] = '/dev/shm/tpu_tier3_cache'
+env['TORCHINDUCTOR_CACHE_DIR'] = '/dev/shm/torchinductor'
+env['XDG_CACHE_HOME'] = '/dev/shm/xdg_cache'
+env['HF_HOME'] = '/dev/shm/hf_cache'
 env['PYTHONPATH'] = '/workspace/sglang/python:/workspace/sglang:/workspace/sglang_deps'
 log = open('/workspace/kimi_k31/sglang_tp32_ep8_rank${rank}.log', 'w')
 p = subprocess.Popen(
@@ -195,7 +214,7 @@ done
 EXTRA_BENCH_ARGS="${EXTRA_BENCH_ARGS:-}"
 DETACH_BENCH="${DETACH_BENCH:-0}"
 if [[ "${DETACH_BENCH}" == "1" ]]; then
-  echo "[Pass 3] Spawning detached in-pod benchmark matrix driver on ${HEAD_POD} (logs: /workspace/kimi_k31/pass3_${CONFIG_TAG}_bench.log)..."
+  echo "[Pass 3] Spawning detached in-pod benchmark matrix driver on ${HEAD_POD} (logs: /workspace/kimi_k31/pass3_${CONFIG_TAG}_bench.log, durable GCS output: /models/benchmark-results/kimi_k31/${CONFIG_TAG})..."
   kctl exec "${HEAD_POD}" -- python3 -c "
 import os, shlex, subprocess
 cmd = [
@@ -204,7 +223,7 @@ cmd = [
     '--wave', '${WAVE}',
     '--config-tag', '${CONFIG_TAG}',
     '--tokenizer', '${MODEL_PATH}',
-    '--output-dir', '/workspace/kimi_k31/results',
+    '--output-dir', '/models/benchmark-results/kimi_k31',
 ] + shlex.split('${EXTRA_BENCH_ARGS}')
 log = open('/workspace/kimi_k31/pass3_${CONFIG_TAG}_bench.log', 'w')
 p = subprocess.Popen(cmd, cwd='/workspace/kimi_k31', stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
