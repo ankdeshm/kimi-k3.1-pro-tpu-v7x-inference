@@ -65,7 +65,7 @@ echo "=== [Pass 2] Master/Head Pod: ${HEAD_POD} (${HEAD_IP}), Topology: ${TOPOLO
 # 1. Sync patch, config, and benchmark scripts to all 4 pods and clean stale workers
 for pod in "${ORDERED_PODS[@]}"; do
   echo "[Pass 2] Syncing scripts & applying Kimi-K3.1-Pro patch on ${pod}..."
-  "${KCTL[@]}" exec "${pod}" -- mkdir -p /workspace/kimi_k31/scripts/patches /workspace/kimi_k31/configs /workspace/kimi_k31/results
+  "${KCTL[@]}" exec "${pod}" -- bash -c 'mkdir -p /dev/shm/workspace/kimi_k31 && mkdir -p /workspace/kimi_k31/scripts/patches /workspace/kimi_k31/configs /workspace/kimi_k31/results'
   "${KCTL[@]}" cp "${REPO_ROOT}/scripts/patches/patch_vllm_torchtpu_kimi_k31.py" "${pod}:/workspace/kimi_k31/scripts/patches/patch_vllm_torchtpu_kimi_k31.py"
   "${KCTL[@]}" cp "${REPO_ROOT}/configs/kimi-k3.1-pro-${TOPOLOGY}.sh" "${pod}:/workspace/kimi_k31/configs/kimi-k3.1-pro-${TOPOLOGY}.sh"
   "${KCTL[@]}" cp "${REPO_ROOT}/benchmarks/run_kimi_k31_matrix.py" "${pod}:/workspace/kimi_k31/run_kimi_k31_matrix.py"
@@ -73,7 +73,7 @@ for pod in "${ORDERED_PODS[@]}"; do
     python3 -c "import os, signal, pathlib; me={1, os.getpid(), os.getppid()}; [os.kill(int(p.name), 9) for p in pathlib.Path(\"/proc\").iterdir() if p.name.isdigit() and int(p.name) not in me and any(k in p.joinpath(\"cmdline\").read_bytes().decode(\"utf-8\",\"ignore\") for k in (\"vllm serve\", \"vllm.entrypoints\", \"sglang\", \"EngineCore\", \"VLLM::EngineCore\", \"VLLM::Worker\", \"multiprocessing.spawn\", \"multiprocessing.resource_tracker\"))]" 2>/dev/null || true
     sleep 4
     pgrep -f raylet >/dev/null 2>&1 && ray stop --force 2>/dev/null || true
-    rm -rf /tmp/ray /dev/shm/vllm_cache /dev/shm/torchinductor /dev/shm/k3mk_* /dev/shm/torch_tpu_pg_store_* /dev/shm/workspace 2>/dev/null || true
+    rm -rf /tmp/ray /dev/shm/vllm_cache /dev/shm/torchinductor /dev/shm/k3mk_* /dev/shm/torch_tpu_pg_store_* /dev/shm/workspace/sglang* 2>/dev/null || true
     mkdir -p /dev/shm/hf_cache /dev/shm/vllm_tmp /dev/shm/vllm_cache /dev/shm/torchinductor
     if [[ -f /models/patches/vllm_torchtpu_v0.32.0/kernels/sparse_core/core_map_helper.py ]]; then
       cp -f /models/patches/vllm_torchtpu_v0.32.0/kernels/sparse_core/core_map_helper.py /workspace/vllm-torchtpu/src/vllm_torchtpu/kernels/sparse_core/core_map_helper.py
