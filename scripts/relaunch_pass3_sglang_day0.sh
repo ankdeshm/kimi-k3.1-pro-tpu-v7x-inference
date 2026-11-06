@@ -73,10 +73,11 @@ for pod in "${ORDERED_PODS[@]}"; do
   kubectl cp "${REPO_ROOT}/configs/sglang-torchtpu-kimi-k3.1-pro-megakernel.sh" "${pod}:/workspace/kimi_k31/configs/sglang-torchtpu-kimi-k3.1-pro-megakernel.sh"
   kubectl cp "${REPO_ROOT}/benchmarks/run_kimi_k31_matrix.py" "${pod}:/workspace/kimi_k31/run_kimi_k31_matrix.py"
   kubectl exec "${pod}" -- bash -c '
-    pkill -9 -f "vllm|sglang|EngineCore" 2>/dev/null || true
+    python3 -c "import os, signal, pathlib; me={1, os.getpid(), os.getppid()}; [os.kill(int(p.name), 9) for p in pathlib.Path(\"/proc\").iterdir() if p.name.isdigit() and int(p.name) not in me and any(k in p.joinpath(\"cmdline\").read_bytes().decode(\"utf-8\",\"ignore\") for k in (\"vllm serve\", \"vllm.entrypoints\", \"sglang\", \"EngineCore\"))]" 2>/dev/null || true
     ray stop --force 2>/dev/null || true
     if [[ ! -d /workspace/sglang/python/sglang ]] && [[ -f /models/sglang_kimi_k31.tar.gz ]]; then
-      tar -xzf /models/sglang_kimi_k31.tar.gz -C /workspace
+      mkdir -p /workspace/sglang
+      tar -xzf /models/sglang_kimi_k31.tar.gz -C /workspace/sglang
     fi
     if [[ ! -d /workspace/sglang_deps ]] && [[ -f /models/sglang_extra_site_packages.tar.gz ]]; then
       mkdir -p /workspace/sglang_deps
@@ -93,6 +94,7 @@ if [[ "${MODE}" == "megakernel" ]]; then
     kubectl exec "${pod}" -- python3 -c "
 import os, subprocess
 env = os.environ.copy()
+env.pop('TPU_VISIBLE_CHIPS', None)
 env['NODE_RANK'] = '${rank}'
 env['NNODES'] = '4'
 env['DIST_INIT_ADDR'] = '${HEAD_IP}:10011'
@@ -104,6 +106,7 @@ env['PYTHONPATH'] = '/workspace/sglang/python:/workspace/sglang:/workspace/sglan
 log = open('/workspace/kimi_k31/sglang_megakernel_rank${rank}.log', 'w')
 p = subprocess.Popen(
     ['bash', '/workspace/kimi_k31/configs/sglang-torchtpu-kimi-k3.1-pro-megakernel.sh'],
+    cwd='/workspace/sglang',
     env=env,
     stdin=subprocess.DEVNULL,
     stdout=log,
@@ -124,6 +127,7 @@ for rank in 0 1 2 3; do
   kubectl exec "${pod}" -- python3 -c "
 import os, subprocess
 env = os.environ.copy()
+env.pop('TPU_VISIBLE_CHIPS', None)
 env['NODE_RANK'] = '${rank}'
 env['NNODES'] = '4'
 env['DIST_INIT_ADDR'] = '${HEAD_IP}:10011'
@@ -134,7 +138,8 @@ env['PORT'] = '${PORT}'
 env['PYTHONPATH'] = '/workspace/sglang/python:/workspace/sglang:/workspace/sglang_deps'
 log = open('/workspace/kimi_k31/sglang_tp32_ep8_rank${rank}.log', 'w')
 p = subprocess.Popen(
-    ['python3', '-u', '/workspace/kimi_k31/configs/sglang-torchtpu-kimi-k3.1-pro-tp32-ep8.py'],
+    ['python3', '-u', '-m', 'benchmark.tpu.launch_server', '--config', '/workspace/kimi_k31/configs/sglang-torchtpu-kimi-k3.1-pro-tp32-ep8.py'],
+    cwd='/workspace/sglang',
     env=env,
     stdin=subprocess.DEVNULL,
     stdout=log,
@@ -159,12 +164,15 @@ kubectl exec "${HEAD_POD}" -- bash -c "
   exit 1
 "
 
-echo "[Pass 3] Running benchmark matrix (--port ${PORT} --wave ${WAVE} --config-tag ${CONFIG_TAG})..."
+EXTRA_BENCH_ARGS="${EXTRA_BENCH_ARGS:-}"
+echo "[Pass 3] Running benchmark matrix (--port ${PORT} --wave ${WAVE} --config-tag ${CONFIG_TAG} ${EXTRA_BENCH_ARGS})..."
 kubectl exec "${HEAD_POD}" -- python3 -u /workspace/kimi_k31/run_kimi_k31_matrix.py \
   --port "${PORT}" \
   --wave "${WAVE}" \
   --config-tag "${CONFIG_TAG}" \
-  --output-dir /workspace/kimi_k31/results
+  --tokenizer "${MODEL_PATH}" \
+  --output-dir /workspace/kimi_k31/results \
+  ${EXTRA_BENCH_ARGS}
 
 mkdir -p "${REPO_ROOT}/results/${CONFIG_TAG}"
 kubectl cp "${HEAD_POD}:/workspace/kimi_k31/results/${CONFIG_TAG}/summary.json" "${REPO_ROOT}/results/${CONFIG_TAG}/summary.json"
