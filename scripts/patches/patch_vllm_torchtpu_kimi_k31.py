@@ -139,6 +139,20 @@ def patch_vllm_torchtpu(torchtpu_root: Path) -> int:
         ],
     )
 
+    # 5. vllm_torchtpu/layers/adapter/fused_moe_decode.py
+    fused_moe_py = torchtpu_root / "src/vllm_torchtpu/layers/adapter/fused_moe_decode.py"
+    if fused_moe_py.exists():
+        total += _patch_file(
+            fused_moe_py,
+            [
+                (
+                    "Guard _async_drafter property in arm_runner_models when non-speculative (drafter is None)",
+                    '    for name in ("drafter", "_async_drafter"):\n        drafter = getattr(model_runner, name, None)',
+                    '    for name in ("drafter", "_async_drafter"):\n        if name == "_async_drafter" and not getattr(model_runner, "_is_async_drafter", False):\n            continue\n        drafter = getattr(model_runner, name, None)',
+                ),
+            ],
+        )
+
     return total
 
 
