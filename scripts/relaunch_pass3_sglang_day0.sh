@@ -96,6 +96,24 @@ for pod in "${ORDERED_PODS[@]}"; do
     if [[ -d /models/sglang_extra_deps_v2 ]]; then
       cp -rf /models/sglang_extra_deps_v2/* /workspace/sglang_deps/
     fi
+    python3 - << "PY"
+import pathlib
+subs = [
+    ("pltpu.semaphore_signal(", "pl.semaphore_signal("),
+    ("pltpu.semaphore_wait(", "pl.semaphore_wait("),
+    ("pltpu.semaphore_read(", "pl.semaphore_read("),
+    ("pltpu.DeviceIdType", "pl.DeviceIdType"),
+    ("pltpu.semaphore(", "pl.semaphore("),
+]
+for fp in pathlib.Path("/workspace/sglang/sglang_tpu").rglob("*.py"):
+    orig = fp.read_text(encoding="utf-8", errors="replace")
+    updated = orig
+    for old, new in subs:
+        updated = updated.replace(old, new)
+    if updated != orig:
+        fp.write_text(updated, encoding="utf-8")
+        print("Patched JAX 0.11 Pallas in:", fp)
+PY
     PYTHONPATH=/workspace/sglang/python:/workspace/sglang:/workspace/sglang_deps python3 -c "import sglang.launch_server, sglang.srt.entrypoints.http_server, sglang_tpu; print(\"SGLANG_IMPORT_OK\")"
   '
 done
